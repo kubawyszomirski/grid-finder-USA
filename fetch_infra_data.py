@@ -57,7 +57,7 @@ def _tag_matches(tags, custom_filter: dict) -> bool:
 
 
 class _OsmHandler(osmium.SimpleHandler):
-    """Collects OSM nodes and ways matching a tag filter into GeoDataFrame rows."""
+    """Collects OSM nodes, ways, and areas matching a tag filter into GeoDataFrame rows."""
 
     def __init__(self, custom_filter: dict, keep_nodes: bool = True) -> None:
         super().__init__()
@@ -81,15 +81,22 @@ class _OsmHandler(osmium.SimpleHandler):
                 pass
 
     def way(self, w) -> None:
+        """Open ways only — closed ways are handled as areas by area()."""
+        if w.is_closed():
+            return
         if not _tag_matches(w.tags, self.custom_filter):
             return
         try:
-            wkb = (
-                _wkb_factory.create_polygon(w)
-                if w.is_closed()
-                else _wkb_factory.create_linestring(w)
-            )
-            self._add(w, wkb)
+            self._add(w, _wkb_factory.create_linestring(w))
+        except Exception:
+            pass
+
+    def area(self, a) -> None:
+        """Handles closed ways and multipolygon relations as proper polygons."""
+        if not _tag_matches(a.tags, self.custom_filter):
+            return
+        try:
+            self._add(a, _wkb_factory.create_multipolygon(a))
         except Exception:
             pass
 
@@ -117,10 +124,10 @@ class Config(BaseConfig):
     TUNNEL_MIN_LEN_M       = 500
     BRIDGE_MIN_LEN_M       = 50
     DAM_MIN_LEN_FT         = 150
-    FARM_MIN_SQFT          = 2_500
-    FARM_ANCHOR_SQFT       = 8_500
+    FARM_MIN_SQFT          = 3000
+    FARM_ANCHOR_SQFT       = 9000
     FARM_CLUSTER_RADIUS_M  = 200
-    FARM_MEGA_STRUCT_SQFT  = 20_000
+    FARM_MEGA_STRUCT_SQFT  = 20000
 
     S3_KEYS: dict[str, str] = {
         # --- Boundaries ---
@@ -224,8 +231,8 @@ class OSMExtractor:
         logger.info(f"  [OSM] {name}")
         try:
             handler = _OsmHandler(custom_filter, keep_nodes=keep_nodes)
-            # locations=True resolves node coordinates for way geometry
-            handler.apply_file(str(self._pbf), locations=True)
+            # locations=True + flex_mem resolves node coordinates for way/relation geometry
+            handler.apply_file(str(self._pbf), locations=True, idx="flex_mem")
 
             if not handler.rows:
                 return None
@@ -380,6 +387,16 @@ class InfrastructurePipeline:
     def _save(self, gdf: gpd.GeoDataFrame | None, category: str, stem: str) -> None:
         ab = self.cfg.state_abbrev
         GeoUtils.save_geojson(gdf, self.cfg.out(category, f"{ab}_{stem}.geojson"))
+
+    @staticmethod
+    def _to_points(gdf: gpd.GeoDataFrame | None) -> gpd.GeoDataFrame | None:
+        """Replace non-point geometries with their centroids."""
+        if gdf is None or gdf.empty:
+            return gdf
+        gdf = gdf.copy()
+        non_point = ~gdf.geometry.type.isin(["Point", "MultiPoint"])
+        gdf.loc[non_point, "geometry"] = gdf.loc[non_point, "geometry"].centroid
+        return gdf
 
     def _merge(self, gdfs: list) -> gpd.GeoDataFrame | None:
         parts = [g for g in gdfs if g is not None and not g.empty]
@@ -595,13 +612,13 @@ class InfrastructurePipeline:
         if self._cached(("UTILITIES", "utilities_merged")): return
         gdfs = [
             self.osm.extract(
-                {"man_made": ["water_works", "wastewater_plant", "pumping_station", "works"],
+                {"man_made": ["water_works", "wastewater_plant", "pumping_station"],
                  "industrial": ["cooling", "heating_station", "water"]},
                 "Utilities_OSM",
             ),
             self._load("wastewater_plants"),
         ]
-        self._save(self._merge(gdfs), "UTILITIES", "utilities_merged")
+        self._save(self._to_points(self._merge(gdfs)), "UTILITIES", "utilities_merged")
 
     # ------------------------------------------------------------------
     # 5. FEMA STRUCTURES
@@ -667,14 +684,13 @@ class InfrastructurePipeline:
         gdfs.append(self.osm.extract(
             {"industrial": ["food", "grain_processing", "slaughterhouse", "meat", "bakery"],
              "craft": ["brewery", "winery", "distillery", "caterer", "confectionery"],
-             "man_made": ["works"],
+             "building": ["brewery"],
              "product": ["food", "meat", "dairy", "seafood", "bakery", "drinks"]},
             "Food_Proc_OSM",
         ))
 
         ag_struct = self.osm.extract(
             {"man_made": ["silo"],
-             "landuse": ["farmyard"],
              "building": ["greenhouse", "granary"]},
             "Ag_Struct_OSM",
         )
@@ -684,12 +700,11 @@ class InfrastructurePipeline:
             # Drop tiny greenhouses
             tiny = (ag_struct.get("building") == "greenhouse") & (ag_struct["area_sqm"] < 500)
             ag_struct = ag_struct[~tiny]
-            ag_struct["geometry"] = ag_struct.geometry.centroid
             gdfs.append(ag_struct)
 
         gdfs.append(self._load("mpi_establishments"))
 
-        self._save(self._merge(gdfs), "AGRICULTURE", "ag_farms_merged")
+        self._save(self._to_points(self._merge(gdfs)), "AGRICULTURE", "ag_farms_merged")
 
     # ------------------------------------------------------------------
     # 6. TRANSPORT
@@ -792,7 +807,7 @@ class InfrastructurePipeline:
 
         # Hotels & short-stay accommodation
         hotels = self.osm.extract(
-            {"tourism": ["hotel", "motel", "hostel", "guest_house"]},
+            {"tourism": ["hotel", "motel", "hostel", "guest_house"], "building": ["hotel"]},
             "Hotels_OSM",
         )
         if hotels is not None:
@@ -810,17 +825,23 @@ class InfrastructurePipeline:
             monasteries["category"] = "Monastery"
             gdfs.append(monasteries)
 
-        # Save combined public infrastructure
-        self._save(self._merge(gdfs), "PUBLIC", "public_infra")
-
         # Hospitality sub-layer (hotels + monasteries only)
+        hosp_categories = {"Hotel", "Monastery"}
         hosp = [
             g for g in gdfs
             if g is not None
             and "category" in g.columns
-            and g["category"].isin(["Hotel", "Monastery"]).any()
+            and g["category"].isin(hosp_categories).any()
         ]
-        self._save(self._merge(hosp), "PUBLIC", "hospitality")
+        self._save(self._to_points(self._merge(hosp)), "PUBLIC", "hospitality")
+
+        # Save combined public infrastructure — hospitality excluded (separate file)
+        non_hosp = [
+            g for g in gdfs
+            if g is not None
+            and not ("category" in g.columns and g["category"].isin(hosp_categories).any())
+        ]
+        self._save(self._to_points(self._merge(non_hosp)), "PUBLIC", "public_infra")
 
     # ------------------------------------------------------------------
     # 9. FRS (Facility Registry)

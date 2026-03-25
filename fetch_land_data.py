@@ -340,7 +340,7 @@ class LandPipeline:
         Output is a dissolved GeoPackage of urban areas.
         """
         BLDG_DENSITY_THRESHOLD = 350    # buildings / km²
-        POP_DENSITY_THRESHOLD  = 2500   # people / sq mile
+        POP_DENSITY_THRESHOLD  = 4000   # people / sq mile
         MIN_CLUSTER_SIZE       = 3
         TILE_SIZE_M            = 1000   # 1 km grid
 
