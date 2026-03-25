@@ -449,7 +449,10 @@ class InfrastructurePipeline:
         merged = self._merge(gdfs)
         if merged is not None:
             polys = merged[merged.geometry.type.isin(["Polygon", "MultiPolygon"])]
-            merged = polys[polys.geometry.area >= self.cfg.SOLAR_MIN_AREA_SQM].copy()
+            polys = polys[polys.geometry.area >= self.cfg.SOLAR_MIN_AREA_SQM].copy()
+            # Dissolve overlapping polygons into single non-overlapping geometries
+            dissolved = polys.dissolve().explode(index_parts=False).reset_index(drop=True)
+            merged = dissolved
         self._save(merged, "GENERATORS", "solar_merged")
 
     def process_wind(self) -> None:
@@ -459,14 +462,16 @@ class InfrastructurePipeline:
 
     def process_eia_generators(self) -> None:
         logger.info("\n--- EIA Generators ---")
-        if self._cached(("GENERATORS", "eia_gas_hydro"), ("GENERATORS", "eia_bess"), ("GENERATORS", "charging_stations")): return
+        if self._cached(("GENERATORS", "eia_gas_hydro"), ("GENERATORS", "bess_charging_stations")): return
         # Files are pre-split by technology in S3 — no filtering needed
         self._save(
             self._merge([self._load("eia_gas"), self._load("eia_hydro")]),
             "GENERATORS", "eia_gas_hydro",
         )
-        self._save(self._load("eia_bess"), "GENERATORS", "eia_bess")
-        self._save(self._load("alt_fuel_stations"), "GENERATORS", "charging_stations")
+        self._save(
+            self._merge([self._load("eia_bess"), self._load("alt_fuel_stations")]),
+            "GENERATORS", "bess_charging_stations",
+        )
 
     # ------------------------------------------------------------------
     # 2. GRID INFRASTRUCTURE
@@ -530,11 +535,18 @@ class InfrastructurePipeline:
              "industrial": ["fracking", "wellsite", "well_cluster"]},
             "Extraction_OSM",
         ))
-        gdfs.append(self.osm.extract(
+        processing = self.osm.extract(
             {"industrial": ["oil", "gas"],
              "man_made": ["gasometer", "storage_tank"]},
             "Processing_OSM",
-        ))
+        )
+        if processing is not None:
+            # Drop water tanks (content=water) and untagged tanks (no content tag)
+            is_tank = processing.get("man_made") == "storage_tank"
+            content = processing.get("content", pd.Series("", index=processing.index)).fillna("")
+            drop = is_tank & (content.str.lower().isin(["water", ""]))
+            processing = processing[~drop].copy()
+        gdfs.append(processing)
 
         transport = self.osm.extract(
             {"pipeline": ["valve", "marker", "vent", "station"],
@@ -556,7 +568,7 @@ class InfrastructurePipeline:
 
     def process_industry(self) -> None:
         logger.info("\n--- Heavy Industry & Manufacturing ---")
-        if self._cached(("INDUSTRY", "industry")): return
+        if self._cached(("INDUSTRY", "industry"), ("INDUSTRY", "works")): return
         gdfs = []
 
         gdfs.append(self.osm.extract(
@@ -576,6 +588,15 @@ class InfrastructurePipeline:
         gdfs.append(self._load("intermodal_freight"))
 
         self._save(self._merge(gdfs), "INDUSTRY", "industry")
+
+        # General industrial works not covered by specific categories
+        works = self.osm.extract(
+            {"landuse": ["industrial"],
+             "man_made": ["works"],
+             "building": ["industrial"]},
+            "Works_OSM",
+        )
+        self._save(self._to_points(works), "INDUSTRY", "works")
 
     def process_mining(self) -> None:
         logger.info("\n--- Mining ---")
