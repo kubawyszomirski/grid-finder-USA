@@ -760,7 +760,11 @@ class InfrastructurePipeline:
 
     def process_roads(self) -> None:
         logger.info("\n--- Roads ---")
-        if self._cached(("TRANSPORT", "roads")): return
+        ab = self.cfg.state_abbrev
+        roads_path = self.cfg.out("TRANSPORT", f"{ab}_roads.parquet")
+        if not self.force and roads_path.exists():
+            logger.info(f"  [Cached] {ab}_roads.parquet — skipping (use --force to rerun)")
+            return
         roads = self.osm.extract(
             {"highway": ["motorway", "trunk", "primary", "secondary", "tertiary",
                          "unclassified", "residential", "service",
@@ -778,7 +782,43 @@ class InfrastructurePipeline:
                 return None
             roads = roads.copy()
             roads["link_category"] = roads.get("highway", pd.Series(dtype=str)).apply(_link_cat)
-        self._save(roads, "TRANSPORT", "roads")
+        GeoUtils.save_parquet(roads, roads_path)
+
+    def process_airports(self) -> None:
+        logger.info("\n--- Airports ---")
+        if self._cached(("TRANSPORT", "airports")): return
+        airports = self.osm.extract(
+            {"aeroway": ["aerodrome", "airstrip", "helipad", "heliport"]},
+            "Airports_OSM",
+            keep_nodes=False,
+        )
+        if airports is not None:
+            airports = airports[airports.geometry.type.isin(["Polygon", "MultiPolygon"])].copy()
+        self._save(airports, "TRANSPORT", "airports")
+
+    def process_parkings(self) -> None:
+        logger.info("\n--- Parkings ---")
+        if self._cached(("TRANSPORT", "parkings")): return
+        parkings = self.osm.extract(
+            {"amenity": ["parking"]},
+            "Parkings_OSM",
+            keep_nodes=False,
+        )
+        if parkings is not None:
+            parkings = parkings[parkings.geometry.type.isin(["Polygon", "MultiPolygon"])].copy()
+        self._save(parkings, "TRANSPORT", "parkings")
+
+    def process_cemeteries(self) -> None:
+        logger.info("\n--- Cemeteries ---")
+        if self._cached(("PUBLIC", "cemeteries")): return
+        cemeteries = self.osm.extract(
+            {"landuse": ["cemetery"], "amenity": ["grave_yard"]},
+            "Cemeteries_OSM",
+            keep_nodes=False,
+        )
+        if cemeteries is not None:
+            cemeteries = cemeteries[cemeteries.geometry.type.isin(["Polygon", "MultiPolygon"])].copy()
+        self._save(cemeteries, "PUBLIC", "cemeteries")
 
     # ------------------------------------------------------------------
     # 7. TELECOM
@@ -906,8 +946,11 @@ class InfrastructurePipeline:
         self.process_agriculture()
         self.process_transport()
         self.process_roads()
+        self.process_airports()
+        self.process_parkings()
         self.process_telecom()
         self.process_public_infra()
+        self.process_cemeteries()
         self.process_frs()
 
         logger.info("\n=== PIPELINE COMPLETE ===")

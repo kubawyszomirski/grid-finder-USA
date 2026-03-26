@@ -328,6 +328,19 @@ class GeoUtils:
         logger.info(f"  [Saved] {len(gdf):,} features → {output_path.relative_to(output_path.parents[3])}")
 
     @staticmethod
+    def save_parquet(
+        gdf: gpd.GeoDataFrame | None,
+        output_path: Path,
+        crs_out: str = "EPSG:4326",
+    ) -> None:
+        if gdf is None or gdf.empty:
+            logger.info(f"  [Skip] No data for {output_path.name}")
+            return
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        gdf.to_crs(crs_out).to_parquet(output_path)
+        logger.info(f"  [Saved] {len(gdf):,} features → {output_path.relative_to(output_path.parents[3])}")
+
+    @staticmethod
     def save_gpkg(
         gdf: gpd.GeoDataFrame | None,
         output_path: Path,
