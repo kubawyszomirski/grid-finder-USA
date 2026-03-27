@@ -143,8 +143,9 @@ class Config(BaseConfig):
         "eia_bess":               "USA/infrastructure/EIA_bess_generators_extracted.parquet",
         # --- Fuel ---
         "alt_fuel_stations":      "USA/infrastructure/alt_fuel_stations_CLEANED.parquet",
-        # --- Substations ---
+        # --- Substations & Grid ---
         "hifld_substations":      "USA/infrastructure/hifld_substationsv2.zip",
+        "transmission_lines":     "USA/infrastructure/transmission-lines.parquet",
         # --- Industry ---
         "hifld_ethanol_gas":      "USA/infrastructure/hifld_ethanol_and_natural_gas_processing.parquet",
         "hifld_compressor":       "USA/infrastructure/hifld_natural_gas_compressor_stations.parquet",
@@ -520,6 +521,31 @@ class InfrastructurePipeline:
             logger.warning("  Road network not found — skipping proximity filter.")
 
         self._save(merged, "SUBSTATIONS", "substations_final")
+
+    def process_transmission_lines(self) -> None:
+        logger.info("\n--- Transmission & Distribution Lines ---")
+        if self._cached(("GRID", "transmission_lines"), ("GRID", "distribution_lines")): return
+
+        # High-voltage transmission lines from S3
+        self._save(self._load("transmission_lines"), "GRID", "transmission_lines")
+
+        # Distribution grid from OSM: power=line / power=minor_line, voltage < 100 kV or untagged
+        osm_lines = self.osm.extract(
+            {"power": ["line", "minor_line"]},
+            "Grid_OSM",
+            keep_nodes=False,
+        )
+        if osm_lines is not None:
+            def _keep_voltage(v) -> bool:
+                if not isinstance(v, str) or not v.strip():
+                    return True
+                try:
+                    return float(v.split(";")[0].strip()) < 69_000
+                except ValueError:
+                    return True
+            voltage_col = osm_lines.get("voltage", pd.Series(dtype=str, index=osm_lines.index))
+            osm_lines = osm_lines[voltage_col.apply(_keep_voltage)].copy()
+        self._save(osm_lines, "GRID", "osm_distribution_lines")
 
     # ------------------------------------------------------------------
     # 3. INDUSTRY & MINING
@@ -938,6 +964,7 @@ class InfrastructurePipeline:
         self.process_wind()
         self.process_eia_generators()
         self.process_substations()
+        self.process_transmission_lines()
         self.process_oil_gas_chemical()
         self.process_industry()
         self.process_mining()
