@@ -657,20 +657,25 @@ def build_topology(
     edges["logical_start"] = None
     edges["logical_end"]   = None
     all_edges = pd.concat([edges, grid_mapped], ignore_index=True)
-    all_edges["edge_id"] = [f"E_{i:06d}" for i in range(len(all_edges))]
 
-    # Assign node IDs
-    coord_to_nid: dict[tuple, str] = {}
-    node_to_edges: dict[str, list] = defaultdict(list)
-    node_to_nbrs:  dict[str, set]  = defaultdict(set)
+    # ------------------------------------------------------------------
+    # Coordinate-based node IDs — deterministic across raw and clean sets:
+    #   same intersection point → same node_id regardless of which branch.
+    # Edge IDs are derived from the sorted node-pair so the same physical
+    # edge gets the same edge_id in both sets.
+    # ------------------------------------------------------------------
+    def _coord_node_id(pt: tuple) -> str:
+        """1 m precision coordinate key → deterministic node ID."""
+        return f"N_{int(round(pt[0]))}_{int(round(pt[1]))}"
+
+    node_to_coord: dict[str, tuple] = {}
+    node_to_edges: dict[str, list]  = defaultdict(list)
+    node_to_nbrs:  dict[str, set]   = defaultdict(set)
     all_edges["start_node"] = None
     all_edges["end_node"]   = None
 
-    def get_node_id(pt: tuple) -> str:
-        key = (round(pt[0], 3), round(pt[1], 3))
-        if key not in coord_to_nid:
-            coord_to_nid[key] = f"N_{len(coord_to_nid):06d}"
-        return coord_to_nid[key]
+    pair_counter: dict[tuple, int] = defaultdict(int)
+    edge_ids: list[str] = []
 
     for idx, row in all_edges.iterrows():
         if pd.notna(row.get("logical_start")):
@@ -679,9 +684,19 @@ def build_topology(
             c = list(row.geometry.coords)
             u_coord, v_coord = c[0], c[-1]
 
-        u_id = get_node_id(u_coord)
-        v_id = get_node_id(v_coord)
-        eid  = row["edge_id"]
+        u_id = _coord_node_id(u_coord)
+        v_id = _coord_node_id(v_coord)
+
+        # Register node coordinates (first encounter wins)
+        node_to_coord.setdefault(u_id, u_coord)
+        node_to_coord.setdefault(v_id, v_coord)
+
+        # Deterministic edge ID from sorted node pair; suffix _pN for parallels
+        pair_key = tuple(sorted((u_id, v_id)))
+        n = pair_counter[pair_key]
+        pair_counter[pair_key] += 1
+        eid = f"E_{pair_key[0]}_{pair_key[1]}" + (f"_p{n}" if n > 0 else "")
+        edge_ids.append(eid)
 
         all_edges.at[idx, "start_node"] = u_id
         all_edges.at[idx, "end_node"]   = v_id
@@ -691,6 +706,8 @@ def build_topology(
             node_to_nbrs[u_id].add(v_id)
             node_to_nbrs[v_id].add(u_id)
 
+    all_edges["edge_id"] = edge_ids
+
     nodes_data = [
         {
             "node_id":         nid,
@@ -698,7 +715,7 @@ def build_topology(
             "connected_nodes": ", ".join(sorted(node_to_nbrs[nid])),
             "geometry":        Point(coord[0], coord[1]),
         }
-        for coord, nid in coord_to_nid.items()
+        for nid, coord in node_to_coord.items()
     ]
     nodes = gpd.GeoDataFrame(nodes_data, crs=all_edges.crs)
 
@@ -711,6 +728,72 @@ def build_topology(
 
     log.info(f"  Topology: {len(all_edges):,} edges, {len(nodes):,} nodes")
     return roads, all_edges, nodes
+
+
+# ---------------------------------------------------------------------------
+# Step 6b — Deduplicate parallel edges (clean set only)
+# ---------------------------------------------------------------------------
+
+# Highway class quality ranking — lower number = higher priority (keep this one)
+_HIGHWAY_PRIORITY: dict[str, int] = {
+    "primary":           0,
+    "secondary":         1,
+    "tertiary":          2,
+    "residential":       3,
+    "service":           4,
+    "osm_grid":          5,
+    "artificial":        6,
+    "artificial_bridge": 7,
+}
+
+
+def deduplicate_parallel_edges(
+    edges: gpd.GeoDataFrame,
+    nodes: gpd.GeoDataFrame,
+) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
+    """
+    For every pair of edges that share the same unordered {start_node, end_node}
+    (i.e. A→B and B→A count as the same pair), keep only the one with the
+    highest highway class and drop the rest.  Node connectivity tables are
+    rebuilt from the surviving edges.
+    """
+    edges = edges.copy()
+
+    # Canonical (sorted) node pair for each edge
+    edges["_pair"] = edges.apply(
+        lambda r: tuple(sorted((r["start_node"], r["end_node"]))), axis=1
+    )
+    edges["_priority"] = edges["highway"].map(_HIGHWAY_PRIORITY).fillna(99).astype(int)
+
+    # Within each pair keep the row with the lowest priority number (= best class)
+    keep_mask = edges.groupby("_pair")["_priority"].transform("min") == edges["_priority"]
+    # If still tied (same class), keep the first occurrence
+    keep_idx = edges[keep_mask].groupby("_pair").head(1).index
+
+    dropped = len(edges) - len(keep_idx)
+    log.info(f"  Removed {dropped:,} parallel/duplicate edges")
+
+    edges = edges.loc[keep_idx].drop(columns=["_pair", "_priority"]).reset_index(drop=True)
+
+    # Rebuild node connectivity from the surviving edges
+    node_to_edges: dict[str, list] = defaultdict(list)
+    node_to_nbrs:  dict[str, set]  = defaultdict(set)
+    for _, row in edges.iterrows():
+        u, v, eid = row["start_node"], row["end_node"], row["edge_id"]
+        node_to_edges[u].append(eid)
+        node_to_edges[v].append(eid)
+        if u != v:
+            node_to_nbrs[u].add(v)
+            node_to_nbrs[v].add(u)
+
+    nodes = nodes.copy()
+    nodes["connected_edges"] = nodes["node_id"].apply(
+        lambda nid: ", ".join(sorted(node_to_edges.get(nid, [])))
+    )
+    nodes["connected_nodes"] = nodes["node_id"].apply(
+        lambda nid: ", ".join(sorted(node_to_nbrs.get(nid, set())))
+    )
+    return edges, nodes
 
 
 # ---------------------------------------------------------------------------
@@ -921,13 +1004,17 @@ def process_state(state_name: str) -> None:
     log.info("\n[SHARED] Applying exclusion zones…")
     roads_excl = apply_exclusion_zones(roads, exclusion_union)
 
+    # Assign road_id ONCE on the shared base so that the same physical road
+    # carries the same road_id in both the raw and clean outputs.
+    log.info("\n[SHARED] Assigning road IDs…")
+    roads_excl = assign_road_ids(roads_excl)
+
     # ------------------------------------------------------------------
     # SET 1 — raw (no cleaning or pruning)
     # ------------------------------------------------------------------
     log.info("\n" + "─" * 60)
     log.info("[SET 1 — RAW] Stitching and splitting…")
     roads_raw = stitch_and_split(roads_excl.copy())
-    roads_raw = assign_road_ids(roads_raw)
 
     log.info("\n[SET 1 — RAW] Building topology…")
     roads_raw, edges_raw, nodes_raw = build_topology(roads_raw)
@@ -971,10 +1058,12 @@ def process_state(state_name: str) -> None:
 
     log.info("\n[SET 2 — CLEAN] Stitching and splitting…")
     roads_clean = stitch_and_split(roads_clean)
-    roads_clean = assign_road_ids(roads_clean)
 
     log.info("\n[SET 2 — CLEAN] Building topology…")
     roads_clean, edges_clean, nodes_clean = build_topology(roads_clean)
+
+    log.info("\n[SET 2 — CLEAN] Deduplicating parallel edges…")
+    edges_clean, nodes_clean = deduplicate_parallel_edges(edges_clean, nodes_clean)
 
     log.info("\n[SET 2 — CLEAN] Injecting artificial paths…")
     roads_clean, edges_clean, nodes_clean = inject_artificial_paths(roads_clean, edges_clean, nodes_clean, exclusions_gdf)
