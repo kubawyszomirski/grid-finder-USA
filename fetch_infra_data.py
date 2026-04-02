@@ -27,6 +27,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote as url_quote
 
+import numpy as np
 import requests
 
 import osmium
@@ -409,6 +410,134 @@ class InfrastructurePipeline:
             crs=self.cfg.crs_metric,
         )
 
+    def _merge_dedup(self, gdfs: list, dist_m: float = 50) -> gpd.GeoDataFrame | None:
+        """Merge GeoDataFrames then deduplicate features within dist_m of each other."""
+        merged = self._merge(gdfs)
+        return self._dedup_within(merged, dist_m) if merged is not None else None
+
+    @staticmethod
+    def _dedup_within(gdf: gpd.GeoDataFrame, dist_m: float = 50) -> gpd.GeoDataFrame:
+        """Remove near-duplicate points/polygons within dist_m of each other (keep first per cluster)."""
+        if gdf is None or len(gdf) < 2:
+            return gdf
+        centroids = gdf.geometry.centroid
+        coords = np.array([(g.x, g.y) for g in centroids])
+        labels = DBSCAN(eps=dist_m, min_samples=1, algorithm="ball_tree").fit_predict(coords)
+        gdf = gdf.copy()
+        gdf["_dedup_cluster"] = labels
+        keep = gdf.groupby("_dedup_cluster", sort=False).apply(lambda g: g.index[0]).values
+        return gdf.loc[keep].drop(columns=["_dedup_cluster"]).reset_index(drop=True)
+
+    def _enrich_substations(self, gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+        """Add transmission line and solar PV attributes to substation points."""
+        gdf = gdf.copy()
+        # Drop any stale join-index columns before we do new spatial joins
+        _join_cols = ["index_left", "index_right"]
+        gdf = gdf.drop(columns=[c for c in _join_cols if c in gdf.columns])
+
+        # --- Load context layers ---
+        trans_lines = self._load("transmission_lines")
+        solar_raw = self._merge([self._load("solar"), self._load("solar_uspvdb")])
+
+        # Drop stale join-index columns that would conflict with sjoin_nearest
+        _join_cols = ["index_left", "index_right"]
+        if trans_lines is not None:
+            trans_lines = trans_lines.drop(columns=[c for c in _join_cols if c in trans_lines.columns])
+        if solar_raw is not None:
+            solar_raw = solar_raw.drop(columns=[c for c in _join_cols if c in solar_raw.columns])
+
+        # A. TRANSMISSION LINE PROXIMITY & VOLTAGE
+        if trans_lines is not None and not trans_lines.empty:
+            nearest_trans = gpd.sjoin_nearest(gdf, trans_lines, how="left", distance_col="_dist_trans")
+            nearest_trans = nearest_trans[~nearest_trans.index.duplicated(keep="first")]
+            gdf["_trans_dist"] = nearest_trans["_dist_trans"].values
+
+            vol_col = "VOLTAGE" if "VOLTAGE" in trans_lines.columns else "voltage"
+            if vol_col in nearest_trans.columns:
+                gdf["_trans_volt_raw"] = nearest_trans[vol_col].values
+            else:
+                gdf["_trans_volt_raw"] = None
+
+            gdf["crossing_transmission_line"] = np.where(gdf["_trans_dist"] <= 100, 1, 0)
+            gdf["trans_line_voltage"] = np.where(
+                gdf["crossing_transmission_line"] == 1, gdf["_trans_volt_raw"], None
+            )
+            gdf = gdf.drop(columns=["_trans_dist", "_trans_volt_raw"])
+        else:
+            gdf["crossing_transmission_line"] = 0
+            gdf["trans_line_voltage"] = None
+
+        # B. SOLAR PV METRICS
+        solar_polys = None
+        if solar_raw is not None and not solar_raw.empty:
+            solar_polys = solar_raw[
+                solar_raw.geometry.type.isin(["Polygon", "MultiPolygon"])
+            ].copy()
+            if solar_polys.empty:
+                solar_polys = None
+
+        if solar_polys is not None:
+            nearest_solar = gpd.sjoin_nearest(gdf, solar_polys, how="left", distance_col="_dist_pv")
+            nearest_solar = nearest_solar[~nearest_solar.index.duplicated(keep="first")]
+            gdf["near_pv"] = nearest_solar["_dist_pv"].values
+
+            pts_buf = gdf.copy()
+            pts_buf["geometry"] = pts_buf.geometry.buffer(200)
+            solar_in_buf = gpd.sjoin(
+                solar_polys, pts_buf[["geometry"]], how="inner", predicate="intersects"
+            )
+            if not solar_in_buf.empty:
+                solar_in_buf["_area"] = solar_in_buf.geometry.area
+                pv_sums = solar_in_buf.groupby("index_right")["_area"].sum()
+                gdf["pv_size"] = gdf.index.map(pv_sums).fillna(0)
+            else:
+                gdf["pv_size"] = 0
+        else:
+            gdf["near_pv"] = None
+            gdf["pv_size"] = 0
+
+        # C. VOLTAGE (standardised to kV)
+        def _calc_voltage(row):
+            v_osm = row.get("voltage")
+            if pd.notna(v_osm) and v_osm != 0:
+                try:
+                    if isinstance(v_osm, str):
+                        vals = [float(x) for x in v_osm.split(";") if x.strip().replace(".", "").isdigit()]
+                        val = max(vals) if vals else 0
+                    else:
+                        val = float(v_osm)
+                    if val > 0:
+                        return val / 1000.0
+                except Exception:
+                    pass
+            v_hifld = row.get("MIN_VOLT")
+            if pd.notna(v_hifld) and v_hifld > 0:
+                return float(v_hifld)
+            return None
+
+        gdf["voltage_kv"] = gdf.apply(_calc_voltage, axis=1)
+
+        # D. SOURCE DATASET (0=both, 1=OSM-only, 2=HIFLD-only)
+        def _calc_source(row):
+            has_id    = pd.notna(row.get("ID")) and row.get("ID") != 0
+            has_power = pd.notna(row.get("power")) or pd.notna(row.get("voltage"))
+            if has_power and has_id:     return 0
+            if has_power and not has_id: return 1
+            if not has_power and has_id: return 2
+            return None
+
+        gdf["source_dataset"] = gdf.apply(_calc_source, axis=1)
+
+        # E. NAICS bulk-power flag
+        if "NAICS_DESC" in gdf.columns:
+            gdf["naics_bulk_power"] = (
+                gdf["NAICS_DESC"].astype(str).str.upper().str.contains("BULK POWER").astype(int)
+            )
+        else:
+            gdf["naics_bulk_power"] = 0
+
+        return gdf
+
     def _cached(self, *specs: tuple[str, str]) -> bool:
         """
         Returns True (and logs a skip) if all expected output files already exist
@@ -451,26 +580,32 @@ class InfrastructurePipeline:
         if merged is not None:
             polys = merged[merged.geometry.type.isin(["Polygon", "MultiPolygon"])]
             polys = polys[polys.geometry.area >= self.cfg.SOLAR_MIN_AREA_SQM].copy()
-            # Dissolve overlapping polygons into single non-overlapping geometries
-            dissolved = polys.dissolve().explode(index_parts=False).reset_index(drop=True)
+            # Buffer slightly so near-touching polygons join, dissolve all overlaps,
+            # explode back to individual polygons, then shrink the buffer back
+            buffered = polys.copy()
+            buffered["geometry"] = buffered.geometry.buffer(1)
+            dissolved = buffered.dissolve().explode(index_parts=False).reset_index(drop=True)
+            dissolved["geometry"] = dissolved.geometry.buffer(-1)
+            dissolved = dissolved[~dissolved.geometry.is_empty & dissolved.geometry.is_valid]
             merged = dissolved
         self._save(merged, "GENERATORS", "solar_merged")
 
     def process_wind(self) -> None:
         logger.info("\n--- Wind ---")
         if self._cached(("GENERATORS", "wind_merged")): return
-        self._save(self._load("wind"), "GENERATORS", "wind_merged")
+        wind = self._load("wind")
+        self._save(self._dedup_within(wind) if wind is not None else None, "GENERATORS", "wind_merged")
 
     def process_eia_generators(self) -> None:
         logger.info("\n--- EIA Generators ---")
         if self._cached(("GENERATORS", "eia_gas_hydro"), ("GENERATORS", "bess_charging_stations")): return
         # Files are pre-split by technology in S3 — no filtering needed
         self._save(
-            self._merge([self._load("eia_gas"), self._load("eia_hydro")]),
+            self._merge_dedup([self._load("eia_gas"), self._load("eia_hydro")]),
             "GENERATORS", "eia_gas_hydro",
         )
         self._save(
-            self._merge([self._load("eia_bess"), self._load("alt_fuel_stations")]),
+            self._merge_dedup([self._load("eia_bess"), self._load("alt_fuel_stations")]),
             "GENERATORS", "bess_charging_stations",
         )
 
@@ -519,6 +654,15 @@ class InfrastructurePipeline:
             merged = merged[~merged.index.duplicated(keep="first")]
         else:
             logger.warning("  Road network not found — skipping proximity filter.")
+
+        # Deduplicate substations within 50 m of each other (OSM / HIFLD overlap)
+        n_before = len(merged)
+        merged = self._dedup_within(merged, dist_m=50)
+        logger.info(f"  Dedup 50 m: {n_before} → {len(merged)} substations")
+
+        # Enrich with transmission line proximity, solar PV metrics, and attribute calculations
+        logger.info("  Enriching substations with transmission / solar attributes...")
+        merged = self._enrich_substations(merged)
 
         self._save(merged, "SUBSTATIONS", "substations_final")
 
@@ -590,7 +734,7 @@ class InfrastructurePipeline:
         for key in ("fracfocus", "hifld_ethanol_gas", "hifld_compressor"):
             gdfs.append(self._load(key))
 
-        self._save(self._merge(gdfs), "INDUSTRY", "oil_gas_chemical")
+        self._save(self._merge_dedup(gdfs), "INDUSTRY", "oil_gas_chemical")
 
     def process_industry(self) -> None:
         logger.info("\n--- Heavy Industry & Manufacturing ---")
@@ -613,7 +757,7 @@ class InfrastructurePipeline:
         ))
         gdfs.append(self._load("intermodal_freight"))
 
-        self._save(self._merge(gdfs), "INDUSTRY", "industry")
+        self._save(self._merge_dedup(gdfs), "INDUSTRY", "industry")
 
         # General industrial works not covered by specific categories
         works = self.osm.extract(
@@ -622,7 +766,8 @@ class InfrastructurePipeline:
              "building": ["industrial"]},
             "Works_OSM",
         )
-        self._save(self._to_points(works), "INDUSTRY", "works")
+        works_pts = self._to_points(works)
+        self._save(self._dedup_within(works_pts) if works_pts is not None else None, "INDUSTRY", "works")
 
     def process_mining(self) -> None:
         logger.info("\n--- Mining ---")
@@ -648,7 +793,7 @@ class InfrastructurePipeline:
         for key in ("mines_active", "sand_gravel", "construction_minerals", "refractory_minerals"):
             gdfs.append(self._load(key))
 
-        self._save(self._merge(gdfs), "MINING", "mining_final")
+        self._save(self._merge_dedup(gdfs), "MINING", "mining_final")
 
     # ------------------------------------------------------------------
     # 4. UTILITIES
@@ -665,7 +810,7 @@ class InfrastructurePipeline:
             ),
             self._load("wastewater_plants"),
         ]
-        self._save(self._to_points(self._merge(gdfs)), "UTILITIES", "utilities_merged")
+        self._save(self._dedup_within(self._to_points(self._merge_dedup(gdfs))), "UTILITIES", "utilities_merged")
 
     # ------------------------------------------------------------------
     # 5. FEMA STRUCTURES
@@ -751,7 +896,7 @@ class InfrastructurePipeline:
 
         gdfs.append(self._load("mpi_establishments"))
 
-        self._save(self._to_points(self._merge(gdfs)), "AGRICULTURE", "ag_farms_merged")
+        self._save(self._dedup_within(self._to_points(self._merge_dedup(gdfs))), "AGRICULTURE", "ag_farms_merged")
 
     # ------------------------------------------------------------------
     # 6. TRANSPORT
@@ -782,7 +927,7 @@ class InfrastructurePipeline:
         dams = self._load("dams")
         if dams is not None and "DAM_LENGTH" in dams.columns:
             dams = dams[dams["DAM_LENGTH"] >= self.cfg.DAM_MIN_LEN_FT]
-        self._save(dams, "TRANSPORT", "dams_major")
+        self._save(self._dedup_within(dams) if dams is not None else None, "TRANSPORT", "dams_major")
 
     def process_roads(self) -> None:
         logger.info("\n--- Roads ---")
@@ -859,7 +1004,7 @@ class InfrastructurePipeline:
             self._load("microwave_towers"),
             self._load("microwave_service"),
         ]
-        self._save(self._merge(major), "TELECOM", "towers_major")
+        self._save(self._merge_dedup(major), "TELECOM", "towers_major")
 
         minor = [
             self.osm.extract(
@@ -867,7 +1012,7 @@ class InfrastructurePipeline:
                 "Towers_Minor_OSM",
             ),
         ]
-        self._save(self._merge(minor), "TELECOM", "towers_minor")
+        self._save(self._merge_dedup(minor), "TELECOM", "towers_minor")
 
     # ------------------------------------------------------------------
     # 8. PUBLIC INFRASTRUCTURE
@@ -920,7 +1065,7 @@ class InfrastructurePipeline:
             and "category" in g.columns
             and g["category"].isin(hosp_categories).any()
         ]
-        self._save(self._to_points(self._merge(hosp)), "PUBLIC", "hospitality")
+        self._save(self._dedup_within(self._to_points(self._merge_dedup(hosp))), "PUBLIC", "hospitality")
 
         # Save combined public infrastructure — hospitality excluded (separate file)
         non_hosp = [
@@ -928,7 +1073,7 @@ class InfrastructurePipeline:
             if g is not None
             and not ("category" in g.columns and g["category"].isin(hosp_categories).any())
         ]
-        self._save(self._to_points(self._merge(non_hosp)), "PUBLIC", "public_infra")
+        self._save(self._dedup_within(self._to_points(self._merge_dedup(non_hosp))), "PUBLIC", "public_infra")
 
     # ------------------------------------------------------------------
     # 9. FRS (Facility Registry)
@@ -944,7 +1089,7 @@ class InfrastructurePipeline:
                 for uri in uris
                 if uri.endswith(".parquet")
             ]
-            self._save(self._merge(gdfs), "FRS", f"{tier}_merged")
+            self._save(self._merge_dedup(gdfs), "FRS", f"{tier}_merged")
 
     # ------------------------------------------------------------------
     # ORCHESTRATOR
