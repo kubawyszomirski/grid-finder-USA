@@ -42,7 +42,7 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import RobustScaler
 
-from generate_utils import BASE_DIR, STATE_FULL_NAMES, _NAME_TO_ABBREV
+from generate.generate_utils import BASE_DIR, STATE_FULL_NAMES, _NAME_TO_ABBREV
 
 warnings.filterwarnings("ignore")
 

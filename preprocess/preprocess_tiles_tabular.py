@@ -45,7 +45,7 @@ warnings.filterwarnings("ignore")
 #            CONFIGURATION
 # ==========================================
 
-BASE_DIR     = Path(".")
+BASE_DIR     = Path("..")
 LABEL_COL    = "grid"
 VAL_FRACTION = 0.20
 RANDOM_STATE = 42

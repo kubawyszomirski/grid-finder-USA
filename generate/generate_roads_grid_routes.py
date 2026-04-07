@@ -35,7 +35,7 @@ from shapely.geometry import LineString, MultiLineString, Point
 from shapely.ops import linemerge, substring
 from tqdm import tqdm
 
-from fetch_utils import STATE_ABBREV, STATE_CRS
+from fetch_data.fetch_utils import STATE_ABBREV, STATE_CRS
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format="%(message)s")

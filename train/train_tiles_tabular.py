@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-train_roads.py
-Train an XGBoost binary classifier on preprocessed road features.
+train_tiles_tabular.py
+Train an XGBoost binary classifier on preprocessed tile tabular features.
 
-Reads from {project}/roads/preprocessed/:
+Reads from {project}/{tiles_dir}/preprocessed/:
     X_train.parquet, y_train.parquet
     X_val.parquet,   y_val.parquet
     feature_config.json
 
-Writes to {project}/models_roads/:
-    roads_model_{N}.ubj          — XGBoost model (binary format)
-    roads_model_{N}_meta.json    — training config, val metrics, feature importances
-    roads_model_{N}_val_preds.parquet — val set road_id + y_true + y_proba
+Writes to {project}/models_tiles/:
+    tiles_model_{N}.ubj          — XGBoost model (binary format)
+    tiles_model_{N}_meta.json    — training config, val metrics, feature importances
+    tiles_model_{N}_val_preds.parquet — val set tile_id + y_true + y_proba
 
 Models are auto-numbered starting at 0 (next available index).
 
 Usage:
-    python train_roads.py --project project-ma
-    python train_roads.py --project project-ma --n-estimators 3000 --max-depth 6
+    python train_tiles_tabular.py --project project-2 --tiles-dir 500_tiles
+    python train_tiles_tabular.py --project project-2 --tiles-dir 500_tiles --n-estimators 3000
 """
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ import pandas as pd
 from sklearn.metrics import roc_auc_score, average_precision_score
 from xgboost import XGBClassifier
 
-from generate_utils import BASE_DIR
+from generate.generate_utils import BASE_DIR
 
 warnings.filterwarnings("ignore")
 
@@ -40,24 +40,25 @@ warnings.filterwarnings("ignore")
 #            CONFIGURATION
 # ==========================================
 
-PROJECT      = "project-ma"
+PROJECT      = "project-2"
+TILES_DIR    = "500_tiles"
 RANDOM_STATE = 42
 
 # XGBoost defaults — all overridable via CLI
 XGB_DEFAULTS = dict(
-    n_estimators        = 5000,
-    learning_rate       = 0.03,
-    max_depth           = 5,
-    min_child_weight    = 5,
-    subsample           = 0.8,
-    colsample_bytree    = 0.8,
-    reg_lambda          = 2.0,
-    gamma               = 0.1,
-    objective           = "binary:logistic",
-    eval_metric         = "aucpr",
-    tree_method         = "hist",
+    n_estimators          = 5000,
+    learning_rate         = 0.03,
+    max_depth             = 5,
+    min_child_weight      = 5,
+    subsample             = 0.8,
+    colsample_bytree      = 0.8,
+    reg_lambda            = 2.0,
+    gamma                 = 0.1,
+    objective             = "binary:logistic",
+    eval_metric           = "aucpr",
+    tree_method           = "hist",
     early_stopping_rounds = 200,
-    n_jobs              = -1,
+    n_jobs                = -1,
 )
 
 
@@ -66,10 +67,10 @@ XGB_DEFAULTS = dict(
 # ==========================================
 
 def _next_model_index(models_dir: Path) -> int:
-    """Return the lowest non-negative integer N for which roads_model_N.ubj doesn't exist."""
+    """Return the lowest non-negative integer N for which tiles_model_N.ubj doesn't exist."""
     existing = {
         int(p.stem.split("_")[-1])
-        for p in models_dir.glob("roads_model_*.ubj")
+        for p in models_dir.glob("tiles_model_*.ubj")
         if p.stem.split("_")[-1].isdigit()
     }
     n = 0
@@ -93,16 +94,18 @@ def _load_parquet(path: Path, label: str) -> pd.DataFrame | None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train XGBoost on preprocessed road features.",
+        description="Train XGBoost on preprocessed tile tabular features.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python train_roads.py --project project-ma\n"
-            "  python train_roads.py --project project-ma --n-estimators 3000 --max-depth 6\n"
+            "  python train_tiles_tabular.py --project project-2 --tiles-dir 500_tiles\n"
+            "  python train_tiles_tabular.py --project project-2 --tiles-dir 500_tiles --max-depth 6\n"
         ),
     )
-    parser.add_argument("--project", default=PROJECT,
+    parser.add_argument("--project",   default=PROJECT,
                         help="Project folder name (default: %(default)s)")
+    parser.add_argument("--tiles-dir", default=TILES_DIR,
+                        help="Tile subfolder inside the project (default: %(default)s)")
     parser.add_argument("--n-estimators",     type=int,   default=XGB_DEFAULTS["n_estimators"])
     parser.add_argument("--learning-rate",    type=float, default=XGB_DEFAULTS["learning_rate"])
     parser.add_argument("--max-depth",        type=int,   default=XGB_DEFAULTS["max_depth"])
@@ -118,33 +121,33 @@ def main() -> None:
         print(f"[ERROR] Project folder not found: {project_dir}")
         return
 
-    prep_dir   = project_dir / "roads" / "preprocessed"
-    models_dir = project_dir / "models_roads"
+    prep_dir   = project_dir / args.tiles_dir / "preprocessed"
+    models_dir = project_dir / "models_tiles"
     models_dir.mkdir(parents=True, exist_ok=True)
 
     model_idx  = _next_model_index(models_dir)
-    model_stem = f"roads_model_{model_idx}"
+    model_stem = f"tiles_model_{model_idx}"
 
     print(f"\n{'='*60}")
-    print(f" Train Roads — {args.project}  →  {model_stem}")
+    print(f" Train Tiles — {args.project}/{args.tiles_dir}  →  {model_stem}")
     print(f"{'='*60}")
 
     # ---- Load preprocessed splits ----
     print(f"\nLoading from {prep_dir} …")
-    X_train = _load_parquet(prep_dir / "X_train.parquet",    "train features")
-    y_train = _load_parquet(prep_dir / "y_train.parquet",    "train labels")
-    X_val   = _load_parquet(prep_dir / "X_val.parquet",      "val features")
-    y_val   = _load_parquet(prep_dir / "y_val.parquet",      "val labels")
+    X_train = _load_parquet(prep_dir / "X_train.parquet", "train features")
+    y_train = _load_parquet(prep_dir / "y_train.parquet", "train labels")
+    X_val   = _load_parquet(prep_dir / "X_val.parquet",   "val features")
+    y_val   = _load_parquet(prep_dir / "y_val.parquet",   "val labels")
 
     if any(x is None for x in [X_train, y_train, X_val, y_val]):
-        print("[ERROR] Missing preprocessed splits — run preprocess-roads.py first.")
+        print("[ERROR] Missing preprocessed splits — run preprocess_tiles_tabular.py first.")
         return
 
     # Squeeze label DataFrames to Series
     y_train_s = y_train.iloc[:, 0].astype(int)
     y_val_s   = y_val.iloc[:, 0].astype(int)
 
-    # Load meta for val road_ids (optional — for output parquet)
+    # Load meta for val tile_ids (optional — for output parquet)
     meta_val = _load_parquet(prep_dir / "meta_val.parquet", "val meta")
 
     # Load feature config for provenance
@@ -156,25 +159,25 @@ def main() -> None:
     n_neg = int((y_train_s == 0).sum())
     scale_pos_weight = round(n_neg / max(n_pos, 1), 4)
     print(f"\n  Train positives: {n_pos:,}  negatives: {n_neg:,}  scale_pos_weight: {scale_pos_weight}")
-    print(f"  Val   positives: {int((y_val_s==1).sum()):,}  negatives: {int((y_val_s==0).sum()):,}")
+    print(f"  Val   positives: {int((y_val_s == 1).sum()):,}  negatives: {int((y_val_s == 0).sum()):,}")
 
     # ---- Build model ----
     params = dict(
-        n_estimators        = args.n_estimators,
-        learning_rate       = args.learning_rate,
-        max_depth           = args.max_depth,
-        min_child_weight    = args.min_child_weight,
-        subsample           = args.subsample,
-        colsample_bytree    = args.colsample_bytree,
-        reg_lambda          = args.reg_lambda,
-        gamma               = args.gamma,
-        objective           = XGB_DEFAULTS["objective"],
-        eval_metric         = XGB_DEFAULTS["eval_metric"],
-        tree_method         = XGB_DEFAULTS["tree_method"],
+        n_estimators          = args.n_estimators,
+        learning_rate         = args.learning_rate,
+        max_depth             = args.max_depth,
+        min_child_weight      = args.min_child_weight,
+        subsample             = args.subsample,
+        colsample_bytree      = args.colsample_bytree,
+        reg_lambda            = args.reg_lambda,
+        gamma                 = args.gamma,
+        objective             = XGB_DEFAULTS["objective"],
+        eval_metric           = XGB_DEFAULTS["eval_metric"],
+        tree_method           = XGB_DEFAULTS["tree_method"],
         early_stopping_rounds = XGB_DEFAULTS["early_stopping_rounds"],
-        n_jobs              = XGB_DEFAULTS["n_jobs"],
-        scale_pos_weight    = scale_pos_weight,
-        random_state        = RANDOM_STATE,
+        n_jobs                = XGB_DEFAULTS["n_jobs"],
+        scale_pos_weight      = scale_pos_weight,
+        random_state          = RANDOM_STATE,
     )
 
     model = XGBClassifier(**params)
@@ -207,8 +210,8 @@ def main() -> None:
         "y_true":  y_val_s.values,
         "y_proba": val_proba,
     })
-    if meta_val is not None and "road_id" in meta_val.columns:
-        val_preds.insert(0, "road_id", meta_val["road_id"].values)
+    if meta_val is not None and "tile_id" in meta_val.columns:
+        val_preds.insert(0, "tile_id", meta_val["tile_id"].values)
     val_preds_path = models_dir / f"{model_stem}_val_preds.parquet"
     val_preds.to_parquet(val_preds_path, index=False)
     print(f"  Saved val predictions → {val_preds_path}")
@@ -221,7 +224,7 @@ def main() -> None:
     meta: dict = {
         "model_index":        model_idx,
         "project":            args.project,
-        "state":              feature_config.get("state"),
+        "tiles_dir":          args.tiles_dir,
         "model_file":         model_path.name,
         "best_iteration":     best_iter,
         "val_roc_auc":        roc_auc,
@@ -237,7 +240,7 @@ def main() -> None:
         "top30_feature_importance_gain": [{"feature": f, "gain": round(g, 4)} for f, g in top_feats],
         "preprocess_config":  {
             k: feature_config.get(k)
-            for k in ("apply_log", "apply_scale", "clip_quantiles", "val_fraction", "random_state")
+            for k in ("apply_log", "apply_scale", "val_fraction", "random_state")
         },
     }
     meta_path = models_dir / f"{model_stem}_meta.json"
