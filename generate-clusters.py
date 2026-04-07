@@ -1,36 +1,40 @@
 #!/usr/bin/env python3
 """
 generate-clusters.py
-Full cluster pipeline for a single state:
+Full cluster pipeline for a single state within a project:
 
   Phase 1 — Generate labeled training points (smart sampling near grid
              lines + roads + background, clipped to training range)
   Phase 2 — Assign ML features to training points
   Phase 3 — Generate prediction candidates (high-res near roads/buildings,
-             low-res elsewhere, clipped to training range minus exclusions)
+             low-res elsewhere, clipped to project prediction_extent)
   Phase 4 — Assign ML features to prediction candidates
   Phase 5 — Train XGBoost (spatial CV) and predict grid_prob
   Phase 6 — HDBSCAN cluster polygons   (high prob → grid areas)
   Phase 7 — HDBSCAN anti-cluster polygons (low prob → no-grid areas)
+  Phase 8 — minor cluster polygons (moderate prob + artificial)
 
 Reads:
   grid_data/3_phase/<S>_3phase.parquet              grid lines
-  grid_ranges/3_phase/<S>_3phase_range.parquet      training/prediction area
+  grid_ranges/3_phase/<S>_3phase_range.parquet      training area
+  <project>/prediction_extent.gpkg                  prediction area
   raw_data/<S>/TRANSPORT/<S>_roads_raw.gpkg
   raw_data/<S>/BUILDINGS/<S>_fema_buildings.geojson
   raw_data/<S>/EXCLUSIONS/<S>_exclusions.gpkg
   raw_data/<S>/...                                  all infra + raster layers
 
-Writes (to clusters/<S>/):
+Writes (to <project>/clusters/):
   <S>_training_features.parquet
   <S>_prediction_features.parquet
   <S>_points_predicted.parquet
   <S>_cluster_polygons.geojson
   <S>_anti_cluster_polygons.geojson
+  <S>_cluster_polygons_minor.geojson
 
 Usage:
   python generate-clusters.py Massachusetts
   python generate-clusters.py MA --force
+  python generate-clusters.py MA --project project-ma --force
 """
 from __future__ import annotations
 
@@ -50,15 +54,18 @@ from sklearn.cluster import HDBSCAN
 from sklearn.metrics import accuracy_score, roc_auc_score, f1_score
 import xgboost as xgb
 
+from generate_utils import (
+    METRIC_CRS, FINAL_CRS, BASE_DIR, STATE_FULL_NAMES, _NAME_TO_ABBREV,
+    CDL_3PHASE_CODES, NLCD_DEVELOPED, NLCD_NATURE, NLCD_CROPS,
+    _find, load_geo,
+)
+
 warnings.filterwarnings("ignore")
 
 
 # ==========================================
 #               CONFIGURATION
 # ==========================================
-
-METRIC_CRS = "EPSG:5070"   # Albers Equal Area — CONUS
-FINAL_CRS  = "EPSG:4326"
 
 # ---- Training sampling ----
 N_GRID_SAMPLES = 12_000
@@ -108,26 +115,7 @@ ARTIFICIAL_BUF_M      = 100    # buffer around point/polygon features for artifi
 # ---- Spatial CV ----
 PARTITION_GRID_SIZE_M = 15_000
 
-STATE_FULL_NAMES: dict[str, str] = {
-    "MA": "Massachusetts",
-    "CT": "Connecticut",
-    "NH": "New Hampshire",
-    "NY": "New York",
-    "NJ": "New Jersey",
-    "RI": "Rhode Island",
-    "VT": "Vermont",
-    "ME": "Maine",
-    "PA": "Pennsylvania",
-}
-_NAME_TO_ABBREV: dict[str, str] = {v: k for k, v in STATE_FULL_NAMES.items()}
-_NAME_TO_ABBREV.update({k: k for k in STATE_FULL_NAMES})
-
-CDL_3PHASE_CODES = np.array([43, 68, 69, 242, 250, 55, 12, 54, 50, 49, 66], dtype=np.int16)
-NLCD_DEVELOPED   = np.array([22, 23, 24], dtype=np.int16)
-NLCD_NATURE      = np.array([11, 12, 31, 41, 42, 43, 51, 52, 71, 72, 73, 74, 90, 95], dtype=np.int16)
-NLCD_CROPS       = np.array([81, 82], dtype=np.int16)
-
-BASE_DIR = Path(".")
+PROJECT = "project-ma"
 
 # Infrastructure tasks: key → list of actions in ["dist", "count", "area"]
 INFRA_TASKS: dict[str, list[str]] = {
@@ -171,14 +159,6 @@ EXCLUDE_COLS = {
 #            PATH RESOLUTION
 # ==========================================
 
-def _find(directory: Path, stem: str) -> Path | None:
-    for ext in (".geojson", ".gpkg", ".parquet", ".shp"):
-        p = directory / (stem + ext)
-        if p.exists():
-            return p
-    return None
-
-
 def get_state_paths(s: str) -> dict:
     raw = BASE_DIR / "raw_data" / s
     return {
@@ -219,23 +199,12 @@ def get_state_paths(s: str) -> dict:
         "nlcd":  raw / "LAND" / f"{s}_nlcd.tif",
         "dem":   raw / "LAND" / f"{s}_dem.tif",
         "lanid": raw / "LAND" / f"{s}_lanid.tif",
-        # Output
-        "out_dir": BASE_DIR / "clusters" / s,
     }
 
 
 # ==========================================
 #                HELPERS
 # ==========================================
-
-def load_geo(path, crs: str | None = None) -> gpd.GeoDataFrame | None:
-    if path is None:
-        return None
-    path = Path(path)
-    if not path.exists():
-        return None
-    gdf = gpd.read_parquet(path) if path.suffix == ".parquet" else gpd.read_file(path)
-    return gdf.to_crs(crs) if crs else gdf
 
 
 def _dynamic_buffer(pts: gpd.GeoDataFrame, buildings: gpd.GeoDataFrame) -> np.ndarray:
@@ -721,19 +690,25 @@ def assign_features(pts: gpd.GeoDataFrame, paths: dict) -> gpd.GeoDataFrame:
 def generate_prediction_candidates(paths: dict) -> gpd.GeoDataFrame:
     """
     High-res grid near roads/buildings + low-res grid elsewhere,
-    clipped to training range minus exclusions.
+    clipped to prediction_extent (project-specific) or training_range as fallback,
+    minus exclusions.
     """
     print("\n[Phase 3] Generating prediction candidates...")
 
-    training_range = load_geo(paths["training_range"], METRIC_CRS)
-    if training_range is None or training_range.empty:
-        raise FileNotFoundError(f"Training range not found: {paths['training_range']}")
+    # Use project prediction_extent if provided, otherwise fall back to training_range
+    pred_extent = load_geo(paths.get("prediction_extent"), METRIC_CRS)
+    if pred_extent is not None and not pred_extent.empty:
+        area_gdf = pred_extent
+    else:
+        area_gdf = load_geo(paths["training_range"], METRIC_CRS)
+        if area_gdf is None or area_gdf.empty:
+            raise FileNotFoundError(f"Training range not found: {paths['training_range']}")
 
     roads      = load_geo(paths["roads"],      METRIC_CRS)
     buildings  = load_geo(paths["buildings"],  METRIC_CRS)
     exclusions = load_geo(paths["exclusions"], METRIC_CRS)
 
-    valid_area = training_range.geometry.unary_union
+    valid_area = area_gdf.geometry.unary_union
     if exclusions is not None and not exclusions.empty:
         valid_area = valid_area.difference(exclusions.geometry.unary_union)
 
@@ -1162,9 +1137,12 @@ def main() -> None:
             "Examples:\n"
             "  python generate-clusters.py Massachusetts\n"
             "  python generate-clusters.py MA --force\n"
+            "  python generate-clusters.py MA --project project-ma --force\n"
         ),
     )
     parser.add_argument("state", help="Full state name or 2-letter abbreviation")
+    parser.add_argument("--project", default=PROJECT,
+                        help="Project folder name (default: %(default)s)")
     parser.add_argument(
         "--force", "-f", action="store_true",
         help="Rerun all steps even if intermediate outputs already exist",
@@ -1177,13 +1155,27 @@ def main() -> None:
         print(f"  Known: {', '.join(sorted(STATE_FULL_NAMES.keys()))}")
         return
 
+    project_dir = BASE_DIR / args.project
+    if not project_dir.exists():
+        print(f"[ERROR] Project folder not found: {project_dir}")
+        return
+
     paths = get_state_paths(abbrev)
-    out   = paths["out_dir"]
+
+    # Inject project prediction_extent into paths
+    extent_path = project_dir / "prediction_extent.gpkg"
+    if extent_path.exists():
+        paths["prediction_extent"] = extent_path
+    else:
+        print(f"  [warn] No prediction_extent.gpkg in {project_dir} — using training_range")
+
+    out = project_dir / "clusters"
     out.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'='*60}")
     print(f" Cluster Pipeline — {STATE_FULL_NAMES[abbrev]} ({abbrev})")
-    print(f" Output : {out}")
+    print(f" Project : {args.project}")
+    print(f" Output  : {out}")
     print(f"{'='*60}")
 
     p_train_feats = out / f"{abbrev}_training_features.parquet"

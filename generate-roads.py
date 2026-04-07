@@ -21,10 +21,15 @@ import numpy as np
 import pandas as pd
 import pyproj
 import rasterio
-from rasterio.features import geometry_window, rasterize
 from rasterio.features import shapes as rio_shapes
-from shapely.geometry import mapping, shape
+from shapely.geometry import shape
 from shapely.ops import unary_union
+
+from generate_utils import (
+    METRIC_CRS, FINAL_CRS, BASE_DIR, STATE_FULL_NAMES, _NAME_TO_ABBREV,
+    CDL_3PHASE_CODES, NLCD_DEVELOPED, NLCD_NATURE, NLCD_CROPS,
+    _find, load_geo, _raster_pct,
+)
 
 warnings.filterwarnings("ignore")
 
@@ -32,44 +37,12 @@ warnings.filterwarnings("ignore")
 #               CONFIGURATION
 # ==========================================
 
-METRIC_CRS = "EPSG:5070"   # Albers Equal Area — CONUS
-FINAL_CRS  = "EPSG:4326"
-
 BUFFER_DIST = 250  # metres — buffer radius for land / building features
-
-STATE_FULL_NAMES: dict[str, str] = {
-    "MA": "Massachusetts",
-    "CT": "Connecticut",
-    "NH": "New Hampshire",
-    "NY": "New York",
-    "NJ": "New Jersey",
-    "RI": "Rhode Island",
-    "VT": "Vermont",
-    "ME": "Maine",
-    "PA": "Pennsylvania",
-}
-_NAME_TO_ABBREV: dict[str, str] = {v: k for k, v in STATE_FULL_NAMES.items()}
-_NAME_TO_ABBREV.update({k: k for k in STATE_FULL_NAMES})  # accept "MA" as-is
-
-CDL_3PHASE_CODES = np.array([43, 68, 69, 242, 250, 55, 12, 54, 50, 49, 66], dtype=np.int16)
-NLCD_DEVELOPED   = np.array([22, 23, 24], dtype=np.int16)
-NLCD_NATURE      = np.array([11, 12, 31, 41, 42, 43, 51, 52, 71, 72, 73, 74, 90, 95], dtype=np.int16)
-NLCD_CROPS       = np.array([81, 82], dtype=np.int16)
-
-BASE_DIR = Path(".")
 
 
 # ==========================================
 #            PATH RESOLUTION
 # ==========================================
-
-def _find(directory: Path, stem: str) -> Path | None:
-    for ext in (".geojson", ".gpkg", ".parquet", ".shp"):
-        p = directory / (stem + ext)
-        if p.exists():
-            return p
-    return None
-
 
 def get_state_paths(abbrev: str) -> dict:
     raw = BASE_DIR / "raw_data" / abbrev
@@ -125,16 +98,6 @@ def get_state_paths(abbrev: str) -> dict:
 # ==========================================
 #              HELPERS
 # ==========================================
-
-def load_geo(path, crs: str | None = None) -> gpd.GeoDataFrame | None:
-    if path is None:
-        return None
-    path = Path(path)
-    if not path.exists():
-        return None
-    gdf = gpd.read_parquet(path) if path.suffix == ".parquet" else gpd.read_file(path)
-    return gdf.to_crs(crs) if crs else gdf
-
 
 def road_curvature(line) -> float:
     """Total turning angle (radians) per metre of road length."""
@@ -283,22 +246,6 @@ def compute_building_stats(roads: gpd.GeoDataFrame, paths: dict) -> gpd.GeoDataF
 # ==========================================
 #      FEATURE: RASTER BUFFER (CDL / NLCD)
 # ==========================================
-
-def _raster_pct(src, geom, codes: np.ndarray) -> float:
-    try:
-        window = geometry_window(src, [mapping(geom)])
-        data   = src.read(1, window=window)
-        tf     = src.window_transform(window)
-        mask   = rasterize(
-            [(mapping(geom), 1)], out_shape=data.shape, transform=tf, fill=0
-        ).astype(bool)
-        if src.nodata is not None:
-            mask &= (data != src.nodata)
-        total = mask.sum()
-        return 0.0 if total == 0 else float(np.isin(data[mask], codes).sum() / total * 100.0)
-    except Exception:
-        return 0.0
-
 
 def compute_raster_buffer(roads: gpd.GeoDataFrame, paths: dict) -> gpd.GeoDataFrame:
     roads = roads.copy()

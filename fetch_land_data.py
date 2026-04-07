@@ -69,6 +69,8 @@ class Config(BaseConfig):
         "population":    "USA/land/population/pop_{abbrev}.parquet",
         # --- State-specific parcels (S3) — zipped geoparquet ---
         "parcels":       "USA/land/parcels/{abbrev}_master_parcels.zip",
+        # --- DSO service territory boundaries (S3) ---
+        "dso_boundaries": "USA/land/dso-boundaries/{abbrev}_dso_boundaries.parquet",
     }
 
     # --- Direct download: NLCD 2023 (ScienceBase) ---
@@ -366,7 +368,25 @@ class LandPipeline:
             zip_tmp.unlink(missing_ok=True)
 
     # ------------------------------------------------------------------
-    # 10. Exclusion Zones (urban areas from building + population density)
+    # 10. DSO Boundaries (S3 parquet)
+    # ------------------------------------------------------------------
+
+    def process_dso_boundaries(self) -> None:
+        logger.info("\n--- DSO Boundaries ---")
+        out = self.cfg.out("LAND", f"{self.cfg.state_abbrev}_dso_boundaries.parquet")
+        if self._cached(out): return
+
+        gdf = self._load_vector("dso_boundaries")
+        if gdf is None or gdf.empty:
+            logger.warning("  No DSO boundaries found for this state.")
+            return
+
+        out.parent.mkdir(parents=True, exist_ok=True)
+        gdf.to_parquet(out, index=False)
+        logger.info(f"  Saved {out.name} ({len(gdf):,} features)")
+
+    # ------------------------------------------------------------------
+    # 11. Exclusion Zones (urban areas from building + population density)
     # ------------------------------------------------------------------
 
     def process_exclusions(self) -> None:
@@ -490,6 +510,7 @@ class LandPipeline:
         self.process_population()
         self.process_dem()
         self.process_parcels()
+        self.process_dso_boundaries()
         self.process_exclusions()
 
         logger.info("\n=== PIPELINE COMPLETE ===")
