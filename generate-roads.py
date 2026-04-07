@@ -113,6 +113,7 @@ def get_state_paths(abbrev: str) -> dict:
         "fema_buildings":           _find(raw / "BUILDINGS",   f"{s}_fema_buildings"),
         "wetlands":                 _find(raw / "LAND",        f"{s}_wetlands"),
         "vrm":                      _find(raw / "LAND",        f"{s}_vrm"),
+        "parcels":                  _find(raw / "LAND",        f"{s}_parcels"),
         # ---- Rasters ----
         "cdl":   raw / "LAND" / f"{s}_cdl.tif",
         "nlcd":  raw / "LAND" / f"{s}_nlcd.tif",
@@ -555,6 +556,72 @@ def compute_per_name_features(roads: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 
 
 # ==========================================
+#       FEATURE: PARCEL VALUE BUFFER
+# ==========================================
+
+_PARCEL_VALUE_COLS = ["imp_val", "lan_val", "tot_val", "tax_amt"]
+_PARCEL_BUFFER_M   = 20  # metres along the road
+
+
+def compute_parcel_values(roads: gpd.GeoDataFrame, paths: dict) -> gpd.GeoDataFrame:
+    """
+    Weighted mean of parcel value columns for parcels within 20 m of each road.
+    Weight = area of intersection between parcel and the 20 m buffer strip, which
+    is proportional to how far the parcel extends alongside the road.
+    """
+    print("   parcel values (20 m)")
+    roads = roads.copy()
+
+    parcels = load_geo(paths.get("parcels"), METRIC_CRS)
+    value_cols = [c for c in _PARCEL_VALUE_COLS if parcels is not None and c in parcels.columns] \
+        if parcels is not None and not parcels.empty else []
+
+    out_cols = [f"parcel_{c}" for c in _PARCEL_VALUE_COLS]
+    for col in out_cols:
+        roads[col] = np.nan
+
+    if not value_cols:
+        return roads
+
+    for c in value_cols:
+        parcels[c] = pd.to_numeric(parcels[c], errors="coerce")
+
+    sindex  = parcels.sindex
+    buffers = roads.geometry.buffer(_PARCEL_BUFFER_M)
+
+    results: dict[str, list] = {c: [] for c in value_cols}
+    for buf in buffers:
+        cands = list(sindex.query(buf, predicate="intersects"))
+        if not cands:
+            for c in value_cols:
+                results[c].append(np.nan)
+            continue
+
+        local = parcels.iloc[cands].copy()
+        local["_w"] = local.geometry.intersection(buf).area
+        total_w = local["_w"].sum()
+
+        if total_w <= 0:
+            for c in value_cols:
+                results[c].append(np.nan)
+            continue
+
+        for c in value_cols:
+            valid = local[c].notna()
+            if not valid.any():
+                results[c].append(0.0)
+            else:
+                w = local.loc[valid, "_w"]
+                v = local.loc[valid, c]
+                results[c].append(float((v * w).sum() / w.sum()))
+
+    for c in value_cols:
+        roads[f"parcel_{c}"] = results[c]
+
+    return roads
+
+
+# ==========================================
 #          COMPUTE ALL FEATURES
 # ==========================================
 
@@ -592,6 +659,9 @@ def compute_all_features(
 
     print("\n  [per-name road stats]")
     roads = compute_per_name_features(roads)
+
+    print("\n  [parcel values]")
+    roads = compute_parcel_values(roads, paths)
 
     return roads
 

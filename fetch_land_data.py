@@ -67,6 +67,8 @@ class Config(BaseConfig):
         # --- State-specific vectors (S3) — {abbrev} = uppercase ---
         "wetlands":      "USA/land/wetlands/{abbrev}_wetlands_simplified_10m.parquet",
         "population":    "USA/land/population/pop_{abbrev}.parquet",
+        # --- State-specific parcels (S3) — zipped geoparquet ---
+        "parcels":       "USA/land/parcels/{abbrev}_master_parcels.zip",
     }
 
     # --- Direct download: NLCD 2023 (ScienceBase) ---
@@ -328,7 +330,43 @@ class LandPipeline:
                 logger.info(f"  Saved {out.name}")
 
     # ------------------------------------------------------------------
-    # 9. Exclusion Zones (urban areas from building + population density)
+    # 9. Parcels (S3 — zipped geoparquet)
+    # ------------------------------------------------------------------
+
+    def process_parcels(self) -> None:
+        logger.info("\n--- Parcels ---")
+        out = self.cfg.out("LAND", f"{self.cfg.state_abbrev}_parcels.parquet")
+        if self._cached(out): return
+
+        zip_tmp = self.s3.download_temp(self.cfg.s3_uri("parcels"), suffix=".zip")
+        if zip_tmp is None:
+            return
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with zipfile.ZipFile(zip_tmp) as zf:
+                    zf.extractall(tmpdir)
+
+                parquet_files = list(Path(tmpdir).rglob("*.parquet")) + \
+                                list(Path(tmpdir).rglob("*.geoparquet"))
+                if not parquet_files:
+                    logger.warning("  No parquet file found inside parcels zip.")
+                    return
+
+                gdf = gpd.read_parquet(parquet_files[0])
+                gdf = self.geo.clip(gdf, self.mask, "parcels")
+                if gdf is None or gdf.empty:
+                    logger.warning("  No parcel features within state boundary.")
+                    return
+
+                out.parent.mkdir(parents=True, exist_ok=True)
+                gdf.to_parquet(out, index=False)
+                logger.info(f"  Saved {out.name} ({len(gdf):,} features)")
+        finally:
+            zip_tmp.unlink(missing_ok=True)
+
+    # ------------------------------------------------------------------
+    # 10. Exclusion Zones (urban areas from building + population density)
     # ------------------------------------------------------------------
 
     def process_exclusions(self) -> None:
@@ -451,6 +489,7 @@ class LandPipeline:
         self.process_scenic_byways()
         self.process_population()
         self.process_dem()
+        self.process_parcels()
         self.process_exclusions()
 
         logger.info("\n=== PIPELINE COMPLETE ===")
