@@ -7,6 +7,7 @@ Training tiles:   3-phase grid range extent for each training state
 Both sets exclude tiles with ≥30% overlap with state exclusion zones.
 """
 
+import boto3
 import geopandas as gpd
 import pandas as pd
 import numpy as np
@@ -16,6 +17,7 @@ from shapely.geometry import box
 from shapely.ops import unary_union
 from pathlib import Path
 import argparse
+import tempfile
 import warnings
 
 from generate_utils import (
@@ -42,9 +44,8 @@ EXTENT_OVERLAP_MIN = 0.70
 # Maximum fraction of a tile that may overlap with exclusion zones before dropping
 EXCLUSION_OVERLAP_MAX = 0.30
 
-STATE_BORDERS_PATH = Path(
-    "/Users/kuba/PycharmProjects/grid-research/data/state_borders/cb_2023_us_state_20m.shp"
-)
+_STATE_BORDERS_S3  = "s3://grid-research-raw-data/USA/state borders/cb_2023_us_state_20m.gpkg"
+_STATE_BORDERS_LOCAL = BASE_DIR / "raw_data" / "_shared" / "cb_2023_us_state_20m.gpkg"
 
 ROAD_CLASSES = ["primary", "secondary", "tertiary", "residential", "service", "osm_grid"]
 
@@ -99,9 +100,18 @@ def get_state_paths(state: str) -> dict:
 #              HELPERS
 # ==========================================
 
+def _ensure_state_borders() -> Path:
+    """Download state borders from S3 if not already cached locally."""
+    if not _STATE_BORDERS_LOCAL.exists():
+        _STATE_BORDERS_LOCAL.parent.mkdir(parents=True, exist_ok=True)
+        bucket, key = _STATE_BORDERS_S3[5:].split("/", 1)
+        boto3.client("s3").download_file(bucket, key, str(_STATE_BORDERS_LOCAL))
+    return _STATE_BORDERS_LOCAL
+
+
 def get_state_border_geom(state: str):
     """Return the state border as a single shapely geometry in METRIC_CRS."""
-    states = gpd.read_file(STATE_BORDERS_PATH)
+    states = gpd.read_file(_ensure_state_borders())
     name = STATE_FULL_NAMES[state]
     border = states[states["NAME"] == name].to_crs(METRIC_CRS)
     return border.geometry.unary_union

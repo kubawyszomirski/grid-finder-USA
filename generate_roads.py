@@ -184,6 +184,7 @@ def compute_distances(roads: gpd.GeoDataFrame, paths: dict) -> gpd.GeoDataFrame:
         {"road_id": roads["road_id"].values},
         geometry=roads.geometry.centroid,
         crs=METRIC_CRS,
+        index=roads.index,
     )
 
     for name, key in DISTANCE_INFRA:
@@ -200,7 +201,7 @@ def compute_distances(roads: gpd.GeoDataFrame, paths: dict) -> gpd.GeoDataFrame:
 
         joined = gpd.sjoin_nearest(centroids, infra, how="left", distance_col=col)
         joined = joined[~joined.index.duplicated(keep="first")]
-        roads[col] = joined[col].values
+        roads[col] = joined[col].reindex(roads.index)
 
     return roads
 
@@ -337,10 +338,11 @@ def compute_lanid_distance(roads: gpd.GeoDataFrame, paths: dict) -> gpd.GeoDataF
         {"road_id": roads["road_id"].values},
         geometry=roads.geometry.centroid,
         crs=METRIC_CRS,
+        index=roads.index,
     )
     joined = gpd.sjoin_nearest(centroids, lanid_pts[["geometry"]], how="left", distance_col="dist_lanid")
     joined = joined[~joined.index.duplicated(keep="first")]
-    roads["dist_lanid"] = joined["dist_lanid"].values
+    roads["dist_lanid"] = joined["dist_lanid"].reindex(roads.index)
     return roads
 
 

@@ -285,7 +285,7 @@ def compute_edge_features(edges: gpd.GeoDataFrame, paths: dict) -> gpd.GeoDataFr
     print("\n[feat] Computing edge features...")
     edges = edges.copy()
 
-    centroids = gpd.GeoDataFrame(geometry=edges.geometry.centroid, crs=METRIC_CRS)
+    centroids = gpd.GeoDataFrame(geometry=edges.geometry.centroid, crs=METRIC_CRS, index=edges.index)
 
     # ------------------------------------------------------------------
     # Distances — direct
@@ -299,7 +299,7 @@ def compute_edge_features(edges: gpd.GeoDataFrame, paths: dict) -> gpd.GeoDataFr
         pts    = _snap_to_points(data)
         joined = gpd.sjoin_nearest(centroids, pts, how="left", distance_col=col)
         joined = joined[~joined.index.duplicated(keep="first")]
-        edges[col] = joined[col].values
+        edges[col] = joined[col].reindex(edges.index)
 
     # ------------------------------------------------------------------
     # Distances — merged (min across group)
@@ -315,7 +315,7 @@ def compute_edge_features(edges: gpd.GeoDataFrame, paths: dict) -> gpd.GeoDataFr
             tcol   = f"_tmp_{key}"
             joined = gpd.sjoin_nearest(centroids, pts, how="left", distance_col=tcol)
             joined = joined[~joined.index.duplicated(keep="first")]
-            edges[tcol] = joined[tcol].values
+            edges[tcol] = joined[tcol].reindex(edges.index)
             tmp_cols.append(tcol)
         if tmp_cols:
             edges[col] = edges[tmp_cols].min(axis=1)
@@ -397,7 +397,7 @@ def compute_edge_features(edges: gpd.GeoDataFrame, paths: dict) -> gpd.GeoDataFr
                 joined    = gpd.sjoin_nearest(centroids, lanid_pts[["geometry"]],
                                               how="left", distance_col="dist_lanid")
                 joined    = joined[~joined.index.duplicated(keep="first")]
-                edges["dist_lanid"] = joined["dist_lanid"].values
+                edges["dist_lanid"] = joined["dist_lanid"].reindex(edges.index)
 
     # ------------------------------------------------------------------
     # Linear overlaps, curvature, slope
