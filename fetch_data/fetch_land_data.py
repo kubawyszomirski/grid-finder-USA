@@ -38,7 +38,7 @@ import pandas as pd
 import requests
 from shapely.geometry import box as shapely_box
 
-from fetch_utils import BaseConfig, S3Reader, GeoUtils
+from .fetch_utils import BaseConfig, S3Reader, GeoUtils
 
 logging.basicConfig(
     level=logging.INFO,

@@ -44,20 +44,22 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Tunable constants
 # ---------------------------------------------------------------------------
+FINAL_CRS          = "EPSG:4326"
+
 OVERLAP_BUFFER     = 12      # m  — grid/road proximity for overlap detection
 OVERLAP_THRESHOLD  = 0.80    # 80 % grid-line overlap → treat as road, drop grid line
 MAX_EXTEND_DIST    = 300     # m  — max endpoint snap for isolated grid lines
 MAX_STITCH_LEN     = 3500    # m  — maximum merged segment length
 SPLIT_THRESHOLD    = 5000    # m  — split roads longer than this
 MIN_CLUSTER_SIZE   = 100     # segments — drop isolated clusters smaller than this
-STUMP_LEN_PASS1    = 250     # m  — first stump-removal pass threshold (clean only)
-STUMP_LEN_PASS2    = 200     # m  — second stump-removal pass threshold (clean only)
+STUMP_LEN_PASS1    = 300     # m  — first stump-removal pass threshold (clean only)
+STUMP_LEN_PASS2    = 250     # m  — second stump-removal pass threshold (clean only)
 ART_NODE_AREA_MIN  = 5_000   # m² — exclusion polygon must exceed this to get nodes
 ART_NODE_DENSITY   = 300_000 # m² per artificial node
 ART_EDGE_MAX_LEN   = 2_000   # m  — hard cap on internal artificial edges
 ART_BRIDGE_MAX_LEN = 1_000   # m  — max bridge from real node to artificial node
 
-DATA_ROOT = Path(__file__).parent / "raw_data"
+DATA_ROOT = Path(__file__).parent.parent / "raw_data"
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +218,7 @@ def integrate_osm_grid(roads: gpd.GeoDataFrame, grid_path: Path) -> gpd.GeoDataF
         lambda g: _extend_line_to_road(g, roads, sindex, MAX_EXTEND_DIST)
     )
 
-    keep = {"geometry", "highway", "is_grid"}
+    keep = {"geometry", "highway", "name", "is_grid"}
     r_cols = [c for c in roads.columns   if c in keep]
     g_cols = [c for c in isolated.columns if c in keep]
 
@@ -750,12 +752,16 @@ _HIGHWAY_PRIORITY: dict[str, int] = {
 def deduplicate_parallel_edges(
     edges: gpd.GeoDataFrame,
     nodes: gpd.GeoDataFrame,
-) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
+    roads: gpd.GeoDataFrame,
+) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame]:
     """
     For every pair of edges that share the same unordered {start_node, end_node}
     (i.e. A→B and B→A count as the same pair), keep only the one with the
     highest highway class and drop the rest.  Node connectivity tables are
     rebuilt from the surviving edges.
+
+    Additionally, any road whose road_id matches a dropped edge AND whose
+    geometry is identical to that edge is also removed from roads.
     """
     edges = edges.copy()
 
@@ -770,10 +776,29 @@ def deduplicate_parallel_edges(
     # If still tied (same class), keep the first occurrence
     keep_idx = edges[keep_mask].groupby("_pair").head(1).index
 
-    dropped = len(edges) - len(keep_idx)
+    dropped_edges = edges.loc[~edges.index.isin(keep_idx)]
+    dropped = len(dropped_edges)
     log.info(f"  Removed {dropped:,} parallel/duplicate edges")
 
     edges = edges.loc[keep_idx].drop(columns=["_pair", "_priority"]).reset_index(drop=True)
+
+    # Remove roads that correspond to dropped edges and share identical geometry
+    if dropped > 0 and "road_id" in dropped_edges.columns and "road_id" in roads.columns:
+        dropped_road_ids = set(dropped_edges["road_id"].dropna())
+        # Build road_id → geometry dict (handles duplicate road_ids safely)
+        road_geom_dict = {
+            rid: geom
+            for rid, geom in zip(roads["road_id"], roads["geometry"])
+        }
+        road_ids_to_drop = set()
+        for _, row in dropped_edges[dropped_edges["road_id"].isin(dropped_road_ids)].iterrows():
+            rid = row["road_id"]
+            road_geom = road_geom_dict.get(rid)
+            if road_geom is not None and row.geometry.equals(road_geom):
+                road_ids_to_drop.add(rid)
+        roads = roads[~roads["road_id"].isin(road_ids_to_drop)].reset_index(drop=True)
+        if road_ids_to_drop:
+            log.info(f"  Removed {len(road_ids_to_drop):,} roads with identical geometry to dropped edges")
 
     # Rebuild node connectivity from the surviving edges
     node_to_edges: dict[str, list] = defaultdict(list)
@@ -793,7 +818,7 @@ def deduplicate_parallel_edges(
     nodes["connected_nodes"] = nodes["node_id"].apply(
         lambda nid: ", ".join(sorted(node_to_nbrs.get(nid, set())))
     )
-    return edges, nodes
+    return edges, nodes, roads
 
 
 # ---------------------------------------------------------------------------
@@ -967,9 +992,9 @@ def save_outputs(
     nodes_path: Path,
 ) -> None:
     """Project all three layers to WGS-84 and write GeoPackages."""
-    roads.to_crs("EPSG:4326").to_file(roads_path, driver="GPKG")
-    edges.to_crs("EPSG:4326").to_file(edges_path, driver="GPKG")
-    nodes.to_crs("EPSG:4326").to_file(nodes_path, driver="GPKG")
+    roads.to_crs(FINAL_CRS).to_file(roads_path, driver="GPKG")
+    edges.to_crs(FINAL_CRS).to_file(edges_path, driver="GPKG")
+    nodes.to_crs(FINAL_CRS).to_file(nodes_path, driver="GPKG")
     log.info(f"  → {roads_path.name}  ({len(roads):,} roads)")
     log.info(f"  → {edges_path.name}  ({len(edges):,} edges)")
     log.info(f"  → {nodes_path.name}  ({len(nodes):,} nodes)")
@@ -1063,7 +1088,7 @@ def process_state(state_name: str) -> None:
     roads_clean, edges_clean, nodes_clean = build_topology(roads_clean)
 
     log.info("\n[SET 2 — CLEAN] Deduplicating parallel edges…")
-    edges_clean, nodes_clean = deduplicate_parallel_edges(edges_clean, nodes_clean)
+    edges_clean, nodes_clean, roads_clean = deduplicate_parallel_edges(edges_clean, nodes_clean, roads_clean)
 
     log.info("\n[SET 2 — CLEAN] Injecting artificial paths…")
     roads_clean, edges_clean, nodes_clean = inject_artificial_paths(roads_clean, edges_clean, nodes_clean, exclusions_gdf)

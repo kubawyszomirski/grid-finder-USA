@@ -25,7 +25,7 @@ from rasterio.features import shapes as rio_shapes
 from shapely.geometry import shape
 from shapely.ops import unary_union
 
-from generate_utils import (
+from .generate_utils import (
     METRIC_CRS, FINAL_CRS, BASE_DIR, STATE_FULL_NAMES, _NAME_TO_ABBREV,
     CDL_3PHASE_CODES, NLCD_DEVELOPED, NLCD_NATURE, NLCD_CROPS,
     _find, load_geo, _raster_pct,
@@ -36,6 +36,12 @@ warnings.filterwarnings("ignore")
 # ==========================================
 #               CONFIGURATION
 # ==========================================
+
+PROJECT           = "project-2"
+PREDICTION_STATES = ["MA"]
+TRAINING_STATES   = ["MA"]
+
+EXCLUDE_GRID_FROM_PREDICTION = False  # subtract 3-phase grid range from prediction extent
 
 BUFFER_DIST = 250  # metres — buffer radius for land / building features
 
@@ -101,6 +107,10 @@ def get_state_paths(abbrev: str) -> dict:
 
 def road_curvature(line) -> float:
     """Total turning angle (radians) per metre of road length."""
+    from shapely.geometry import MultiLineString
+    if isinstance(line, MultiLineString):
+        parts = list(line.geoms)
+        line = max(parts, key=lambda g: g.length)
     coords = np.array(line.coords)
     if len(coords) < 3:
         return 0.0
@@ -130,17 +140,32 @@ def _snap_infra_to_points(data: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 # ==========================================
 
 def compute_grid(roads: gpd.GeoDataFrame, paths: dict) -> gpd.GeoDataFrame:
-    """Binary: ≥50 % of the road runs alongside a grid line (buffer 20 m)."""
+    """Binary: ≥50 % of the road runs alongside a grid line (buffer 20 m).
+    Uses STRtree to only intersect each road against nearby grid buffers,
+    avoiding the slow single-unary-union approach.
+    """
     print("   grid")
     roads = roads.copy()
+    roads["grid"] = 0
     grid_data = load_geo(paths.get("grid_lines"), METRIC_CRS)
     if grid_data is None or grid_data.empty:
-        roads["grid"] = 0
         return roads
-    grid_buf = grid_data.geometry.buffer(20).unary_union
-    road_len  = roads.geometry.length.replace(0, np.nan)
-    overlap   = roads.geometry.intersection(grid_buf).length
-    roads["grid"] = ((overlap / road_len).fillna(0) >= 0.50).astype(int)
+
+    grid_bufs = grid_data.geometry.buffer(20)
+    tree = grid_bufs.sindex
+    road_len = roads.geometry.length.values
+
+    overlaps = np.zeros(len(roads), dtype=np.float64)
+    for i, road in enumerate(roads.geometry):
+        cands = list(tree.query(road, predicate="intersects"))
+        if not cands:
+            continue
+        local_union = grid_bufs.iloc[cands].unary_union
+        overlaps[i] = road.intersection(local_union).length
+
+    roads["grid"] = (
+        np.where(road_len > 0, overlaps / road_len, 0.0) >= 0.50
+    ).astype(int)
     return roads
 
 
@@ -494,7 +519,8 @@ def compute_per_name_features(roads: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     weighted_curv = grp.apply(
         lambda g: float(
             (g["curvature_per_m"] * g["_len"]).sum() / g["_len"].sum()
-        ) if g["_len"].sum() > 0 else 0.0
+        ) if g["_len"].sum() > 0 else 0.0,
+        include_groups=False,
     )
 
     roads.loc[named_mask, "name_total_length_m"]  = roads.loc[named_mask, "name"].map(total_len)
@@ -582,6 +608,8 @@ def compute_all_features(
     paths = get_state_paths(abbrev)
     print(f"\n  [{abbrev}] Computing features for {len(roads):,} roads…")
 
+    roads["length_m"] = roads.geometry.length
+
     if is_training:
         roads = compute_grid(roads, paths)
 
@@ -619,54 +647,91 @@ def compute_all_features(
 #                  MAIN
 # ==========================================
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Road feature generation pipeline.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Examples:\n"
-            "  python generate-roads.py Massachusetts\n"
-            "  python generate-roads.py MA --train\n"
-        ),
-    )
-    parser.add_argument("state", help="State full name or 2-letter abbreviation")
-    parser.add_argument(
-        "--train", action="store_true",
-        help="Training mode — adds the 'grid' binary feature",
-    )
-    args = parser.parse_args()
-
-    abbrev = _NAME_TO_ABBREV.get(args.state.strip())
-    if abbrev is None:
-        print(f"[ERROR] Unknown state: '{args.state}'")
-        print(f"  Known states: {', '.join(sorted(STATE_FULL_NAMES.keys()))}")
-        return
-
+def _process_state(abbrev: str, project_dir: Path, out_dir: Path, is_training: bool) -> None:
     paths = get_state_paths(abbrev)
     roads_path = paths["roads_clean"]
 
     if not roads_path.exists():
-        print(f"[ERROR] roads_clean not found: {roads_path}")
-        print("  → Run  python roads.py <state>  first to generate the road network.")
+        print(f"[{abbrev}] ERROR: roads_clean not found: {roads_path}")
+        print("  → Run generate_roads_grid_routes first to generate the road network.")
         return
 
-    print(f"\nLoading {roads_path.name} …")
+    # Load extent for clipping
+    extent_file = "training_extent.gpkg" if is_training else "prediction_extent.gpkg"
+    extent_gdf = load_geo(project_dir / extent_file, METRIC_CRS)
+    if extent_gdf is None or extent_gdf.empty:
+        print(f"[{abbrev}] ERROR: {extent_file} not found in {project_dir}")
+        return
+    extent_union = extent_gdf.geometry.unary_union
+
+    if is_training:
+        grid_range = load_geo(
+            BASE_DIR / "grid_ranges" / "3_phase" / f"{abbrev}_3phase_range.parquet", METRIC_CRS
+        )
+        if grid_range is not None and not grid_range.empty:
+            extent_union = extent_union.intersection(grid_range.geometry.unary_union)
+
+    if not is_training and EXCLUDE_GRID_FROM_PREDICTION:
+        grid_range = load_geo(
+            BASE_DIR / "grid_ranges" / "3_phase" / f"{abbrev}_3phase_range.parquet", METRIC_CRS
+        )
+        if grid_range is not None and not grid_range.empty:
+            extent_union = extent_union.difference(grid_range.geometry.unary_union)
+
+    print(f"\n[{abbrev}] Loading {roads_path.name} …")
     roads = gpd.read_file(roads_path).to_crs(METRIC_CRS)
-    print(f"  {len(roads):,} road segments")
+    print(f"  {len(roads):,} road segments (full state)")
+
+    roads = gpd.clip(roads, extent_union).reset_index(drop=True)
+    print(f"  {len(roads):,} road segments after clipping to {extent_file}")
+
+    if roads.empty:
+        print(f"[{abbrev}] No roads within extent — skipping.")
+        return
 
     if "road_id" not in roads.columns:
-        print("[Warning] road_id column missing — assigning sequential IDs")
+        print(f"[{abbrev}] Warning: road_id missing — assigning sequential IDs")
         roads["road_id"] = [f"R_{i:06d}" for i in range(len(roads))]
 
-    roads_out = compute_all_features(roads, abbrev, is_training=args.train)
+    roads_out = compute_all_features(roads, abbrev, is_training=is_training)
 
-    out_path = roads_path.parent / roads_path.name.replace("_roads_clean", "_roads_features")
+    suffix = "training" if is_training else "prediction"
+    out_path = out_dir / f"{abbrev}_roads_{suffix}.gpkg"
+    out_dir.mkdir(parents=True, exist_ok=True)
     roads_out.to_crs(FINAL_CRS).to_file(out_path, driver="GPKG")
-    print(
-        f"\n[DONE] {out_path.name}"
-        f"  ({len(roads_out):,} roads, {roads_out.shape[1]} columns)"
-    )
+    print(f"[DONE] {out_path.name}  ({len(roads_out):,} roads, {roads_out.shape[1]} columns)")
+
+
+def main() -> None:
+    project_dir = BASE_DIR / PROJECT
+    out_dir = project_dir / "roads"
+
+    print("\n" + "=" * 60)
+    print("PREDICTION ROADS")
+    print("=" * 60)
+    for state in PREDICTION_STATES:
+        abbrev = _NAME_TO_ABBREV.get(state, state)
+        _process_state(abbrev, project_dir, out_dir, is_training=False)
+
+    print("\n" + "=" * 60)
+    print("TRAINING ROADS")
+    print("=" * 60)
+    for state in TRAINING_STATES:
+        abbrev = _NAME_TO_ABBREV.get(state, state)
+        _process_state(abbrev, project_dir, out_dir, is_training=True)
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Generate road features for prediction and training.")
+    parser.add_argument("--project", default=PROJECT,          help="Project folder name (default: %(default)s)")
+    parser.add_argument("--predict", nargs="+", default=PREDICTION_STATES, metavar="STATE", help="State(s) for prediction roads")
+    parser.add_argument("--train",   nargs="+", default=TRAINING_STATES,   metavar="STATE", help="State(s) for training roads (includes grid feature)")
+    parser.add_argument("--exclude-grid-from-prediction", action="store_true", help="Exclude 3-phase grid range from prediction extent")
+    args = parser.parse_args()
+
+    PROJECT                      = args.project
+    PREDICTION_STATES            = args.predict
+    TRAINING_STATES              = args.train
+    EXCLUDE_GRID_FROM_PREDICTION = args.exclude_grid_from_prediction
+
     main()

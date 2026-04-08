@@ -16,4 +16,5 @@ dependencies = [
     "s3fs>=0.4.2",
     "scikit-learn>=1.8.0",
     "tqdm>=4.67.3",
+    "xgboost>=3.2.0",
 ]

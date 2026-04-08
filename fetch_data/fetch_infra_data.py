@@ -37,7 +37,7 @@ import geopandas as gpd
 import pandas as pd
 from sklearn.cluster import DBSCAN
 
-from fetch_utils import BaseConfig, S3Reader, GeoUtils, STATE_ABBREV, STATE_CRS
+from .fetch_utils import BaseConfig, S3Reader, GeoUtils, STATE_ABBREV, STATE_CRS
 
 _wkb_factory = osmium.geom.WKBFactory()
 

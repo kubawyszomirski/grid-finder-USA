@@ -69,9 +69,10 @@ HIGHWAY_COL = "highway"
 # Known highway classes — fixed list for consistent one-hot encoding
 HIGHWAY_CLASSES = [
     "primary", "secondary", "tertiary", "residential",
-    "service", "osm_grid", "unclassified", "trunk",
-    "motorway", "living_street", "other",
+    "service", "osm_grid", "other",
 ]
+
+HIGHWAY_EXCLUDE = {"artificial", "artificial_bridge"}
 
 # Usage-mode columns produced by pathfinding
 USAGE_MODE_COLS = ["p1_usage_mode", "p2_usage_mode"]
@@ -92,7 +93,13 @@ def load_edges(path: Path) -> pd.DataFrame | None:
         print(f"  [not found] {path}")
         return None
     gdf = gpd.read_file(path)
-    df  = pd.DataFrame(gdf.drop(columns=["geometry"], errors="ignore"))
+    if "highway" in gdf.columns:
+        before = len(gdf)
+        gdf = gdf[~gdf["highway"].isin(HIGHWAY_EXCLUDE)]
+        dropped = before - len(gdf)
+        if dropped:
+            print(f"  Dropped {dropped:,} artificial edge segments")
+    df = pd.DataFrame(gdf.drop(columns=["geometry"], errors="ignore"))
     print(f"  {path.name}: {len(df):,} rows, {df.shape[1]} columns")
     return df
 

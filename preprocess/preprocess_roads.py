@@ -68,9 +68,10 @@ HIGHWAY_COL = "highway"
 # across train and predict even when some classes are absent in a split
 HIGHWAY_CLASSES = [
     "primary", "secondary", "tertiary", "residential",
-    "service", "osm_grid", "unclassified", "trunk",
-    "motorway", "living_street", "other",
+    "service", "osm_grid", "other",
 ]
+
+HIGHWAY_EXCLUDE = {"artificial", "artificial_bridge"}
 
 # Outlier clipping applied to distance and area features
 CLIP_QUANTILES = (0.001, 0.999)
@@ -85,7 +86,13 @@ def load_roads(path: Path) -> pd.DataFrame | None:
         print(f"  [not found] {path}")
         return None
     gdf = gpd.read_file(path)
-    df  = pd.DataFrame(gdf.drop(columns=["geometry"], errors="ignore"))
+    if "highway" in gdf.columns:
+        before = len(gdf)
+        gdf = gdf[~gdf["highway"].isin(HIGHWAY_EXCLUDE)]
+        dropped = before - len(gdf)
+        if dropped:
+            print(f"  Dropped {dropped:,} artificial road segments")
+    df = pd.DataFrame(gdf.drop(columns=["geometry"], errors="ignore"))
     print(f"  {path.name}: {len(df):,} rows, {df.shape[1]} columns")
     return df
 

@@ -13,14 +13,15 @@ import pandas as pd
 import numpy as np
 import rasterio
 from rasterio.warp import reproject, Resampling, transform_bounds
-from shapely.geometry import box
+from rasterio.features import geometry_window, rasterize
+from shapely.geometry import box, mapping
 from shapely.ops import unary_union
 from pathlib import Path
 import argparse
 import tempfile
 import warnings
 
-from generate_utils import (
+from .generate_utils import (
     METRIC_CRS, FINAL_CRS, BASE_DIR, STATE_FULL_NAMES,
     CDL_3PHASE_CODES, NLCD_DEVELOPED, NLCD_NATURE, NLCD_CROPS,
     _find, load_geo, _raster_pct,
@@ -37,6 +38,8 @@ PREDICTION_STATES = ["MA"]      # state(s) for prediction tiles
 TRAINING_STATES = ["MA"]        # state(s) for training tiles
 
 TILE_SIZE = 500                 # metres
+
+EXCLUDE_GRID_FROM_PREDICTION = False  # subtract 3-phase grid range from prediction extent
 
 # Minimum fraction of a tile that must overlap with the valid extent to keep it
 EXTENT_OVERLAP_MIN = 0.70
@@ -178,11 +181,12 @@ def build_prediction_extent(project_dir: Path, states: list[str]):
         border = get_state_border_geom(state)
         clipped = border.intersection(pred_union)
 
-        grid_range = load_geo(
-            BASE_DIR / "grid_ranges" / "3_phase" / f"{state}_3phase_range.parquet", METRIC_CRS
-        )
-        if grid_range is not None and not grid_range.empty:
-            clipped = clipped.difference(grid_range.geometry.unary_union)
+        if EXCLUDE_GRID_FROM_PREDICTION:
+            grid_range = load_geo(
+                BASE_DIR / "grid_ranges" / "3_phase" / f"{state}_3phase_range.parquet", METRIC_CRS
+            )
+            if grid_range is not None and not grid_range.empty:
+                clipped = clipped.difference(grid_range.geometry.unary_union)
 
         extents.append(clipped)
 
@@ -206,19 +210,25 @@ def generate_prediction_tiles(project_dir: Path, states: list[str]) -> gpd.GeoDa
     return tiles
 
 
-def generate_training_tiles(states: list[str]) -> gpd.GeoDataFrame:
-    print("[TRAINING] Generating tiles per state...")
+def generate_training_tiles(project_dir: Path, states: list[str]) -> gpd.GeoDataFrame:
+    print("[TRAINING] Building extent...")
+    train_extent_gdf = load_geo(project_dir / "training_extent.gpkg", METRIC_CRS)
+    train_union = train_extent_gdf.geometry.unary_union
+
     all_tiles = []
     offset = 0
     for state in states:
+        border = get_state_border_geom(state)
+        extent = border.intersection(train_union)
         grid_range = load_geo(
             BASE_DIR / "grid_ranges" / "3_phase" / f"{state}_3phase_range.parquet", METRIC_CRS
         )
-        if grid_range is None:
-            print(f"  [{state}] grid range not found — skipping")
+        if grid_range is not None and not grid_range.empty:
+            extent = extent.intersection(grid_range.geometry.unary_union)
+        if extent.is_empty:
+            print(f"  [{state}] no overlap with training_extent — skipping")
             continue
 
-        extent = grid_range.geometry.unary_union
         tiles = make_grid(extent, TILE_SIZE)
         tiles = filter_extent(tiles, extent)
 
@@ -342,6 +352,8 @@ def compute_roads(tiles: gpd.GeoDataFrame, paths: dict) -> gpd.GeoDataFrame:
 
     roads = load_geo(path, METRIC_CRS)
     roads = roads[roads["highway"].isin(ROAD_CLASSES)][["highway", "geometry"]].copy().reset_index(drop=True)
+    roads["geometry"] = roads["geometry"].make_valid()
+    roads = roads[~roads["geometry"].is_empty & roads["geometry"].notna()].reset_index(drop=True)
     if roads.empty:
         return tiles
 
@@ -450,8 +462,7 @@ def compute_terrain(tiles: gpd.GeoDataFrame, paths: dict) -> gpd.GeoDataFrame:
             s = slopes[np.isfinite(slopes)]
             if s.size == 0:
                 return np.nan
-            raw_score = (0.7 * np.mean(s) + 0.3 * np.percentile(s, 90)) / 30.0
-            return float(np.clip(raw_score, 0.0, 1.0) * 100.0)
+            return float(np.mean(s))
         except Exception:
             return np.nan
 
@@ -691,7 +702,7 @@ def main():
     print("TRAINING TILES")
     print("=" * 60)
 
-    train_tiles = generate_training_tiles(TRAINING_STATES)
+    train_tiles = generate_training_tiles(project_dir, TRAINING_STATES)
 
     parts = []
     for state in TRAINING_STATES:
@@ -713,12 +724,14 @@ if __name__ == "__main__":
     parser.add_argument("--project",     default=PROJECT,          help="Project folder name (default: %(default)s)")
     parser.add_argument("--predict",     nargs="+", default=PREDICTION_STATES, metavar="STATE", help="State(s) for prediction tiles")
     parser.add_argument("--train",       nargs="+", default=TRAINING_STATES,   metavar="STATE", help="State(s) for training tiles")
-    parser.add_argument("--tile-size",   type=int,  default=TILE_SIZE,         help="Tile size in metres (default: %(default)s)")
+    parser.add_argument("--tile-size",          type=int,  default=TILE_SIZE,         help="Tile size in metres (default: %(default)s)")
+    parser.add_argument("--exclude-grid-from-prediction", action="store_true", help="Exclude 3-phase grid range from prediction extent")
     args = parser.parse_args()
 
-    PROJECT           = args.project
-    PREDICTION_STATES = args.predict
-    TRAINING_STATES   = args.train
-    TILE_SIZE         = args.tile_size
+    PROJECT                      = args.project
+    PREDICTION_STATES            = args.predict
+    TRAINING_STATES              = args.train
+    TILE_SIZE                    = args.tile_size
+    EXCLUDE_GRID_FROM_PREDICTION = args.exclude_grid_from_prediction
 
     main()

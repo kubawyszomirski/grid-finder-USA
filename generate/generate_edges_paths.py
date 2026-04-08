@@ -53,7 +53,7 @@ from scipy.spatial import cKDTree
 from shapely.geometry import LineString, Point, shape
 from shapely.strtree import STRtree
 
-from generate_utils import (
+from .generate_utils import (
     METRIC_CRS, FINAL_CRS, BASE_DIR, STATE_FULL_NAMES, _NAME_TO_ABBREV,
     CDL_3PHASE_CODES, _find, load_geo, _raster_pct,
 )
@@ -66,6 +66,9 @@ warnings.filterwarnings("ignore")
 # ==========================================
 
 PROJECT = "project-ma"
+PREDICTION_STATES = ["MA"]
+TRAINING_STATES   = ["MA"]
+EXCLUDE_GRID_FROM_PREDICTION = False  # subtract 3-phase grid range from prediction extent
 
 # ---- Pathfinding ----
 N_NEAREST_SUBS_P1     = 2
@@ -155,6 +158,8 @@ def get_state_paths(s: str) -> dict:
         "lanid": raw / "LAND" / f"{s}_lanid.tif",
         # ---- DSO service territories ----
         "dso_boundaries": _find(raw / "LAND", f"{s}_dso_boundaries"),
+        # ---- Grid lines ----
+        "grid_lines": BASE_DIR / "grid_data" / "3_phase" / f"{s}_3phase.parquet",
     }
 
 
@@ -162,9 +167,9 @@ def get_project_paths(s: str, project_dir: Path) -> dict:
     """Cluster outputs are project-specific (depend on prediction_extent)."""
     clu = project_dir / "clusters"
     return {
-        "clusters":       clu / f"{s}_cluster_polygons.geojson",
-        "clusters_minor": clu / f"{s}_cluster_polygons_minor.geojson",
-        "anti_clusters":  clu / f"{s}_anti_cluster_polygons.geojson",
+        "clusters":       clu / f"{s}_cluster_polygons.gpkg",
+        "clusters_minor": clu / f"{s}_cluster_polygons_minor.gpkg",
+        "anti_clusters":  clu / f"{s}_anti_cluster_polygons.gpkg",
     }
 
 
@@ -527,12 +532,17 @@ def build_graph(
     row_to_u: dict[int, int] = {}
     row_to_v: dict[int, int] = {}
 
+    def _line_coords(geom):
+        if geom.geom_type == "MultiLineString":
+            geom = max(geom.geoms, key=lambda g: g.length)
+        return list(geom.coords)
+
     if has_uv:
         for idx, row in edges_gdf.iterrows():
             geom = row.geometry
             if geom is None or geom.is_empty:
                 continue
-            coords = list(geom.coords)
+            coords = _line_coords(geom)
             if len(coords) < 2:
                 continue
             u, v = int(row["u"]), int(row["v"])
@@ -549,7 +559,7 @@ def build_graph(
             geom = row.geometry
             if geom is None or geom.is_empty:
                 continue
-            coords = list(geom.coords)
+            coords = _line_coords(geom)
             if len(coords) < 2:
                 continue
             for raw_xy, role in [(coords[0], "u"), (coords[-1], "v")]:
@@ -818,39 +828,44 @@ def run_pathfinding_pass(
 #                  MAIN
 # ==========================================
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Edge/path pipeline — graph from edges_raw, "
-                    "cluster pathfinding, outputs edges_clean to project folder.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Examples:\n"
-            "  python generate-edges-paths.py Massachusetts\n"
-            "  python generate-edges-paths.py MA\n"
-            "  python generate-edges-paths.py MA --project project-ma\n"
-        ),
-    )
-    parser.add_argument("state", help="Full state name or 2-letter abbreviation")
-    parser.add_argument("--project", default=PROJECT,
-                        help="Project folder name (default: %(default)s)")
-    args = parser.parse_args()
+def compute_grid(edges: gpd.GeoDataFrame, paths: dict) -> gpd.GeoDataFrame:
+    """Binary: ≥50 % of the edge runs alongside a 3-phase grid line (buffer 20 m).
+    Uses STRtree to only intersect each edge against nearby grid buffers.
+    """
+    print("   grid binary")
+    edges = edges.copy()
+    edges["grid"] = 0
+    grid_data = load_geo(paths.get("grid_lines"), METRIC_CRS)
+    if grid_data is None or grid_data.empty:
+        return edges
 
-    abbrev = _NAME_TO_ABBREV.get(args.state.strip())
-    if abbrev is None:
-        print(f"[ERROR] Unknown state: '{args.state}'")
-        print(f"  Known: {', '.join(sorted(STATE_FULL_NAMES.keys()))}")
-        return
+    grid_bufs = grid_data.geometry.buffer(20)
+    tree = grid_bufs.sindex
+    edge_len = edges.geometry.length.values
 
-    project_dir = BASE_DIR / args.project
-    if not project_dir.exists():
-        print(f"[ERROR] Project folder not found: {project_dir}")
-        return
+    overlaps = np.zeros(len(edges), dtype=np.float64)
+    for i, geom in enumerate(edges.geometry):
+        cands = list(tree.query(geom, predicate="intersects"))
+        if not cands:
+            continue
+        local_union = grid_bufs.iloc[cands].unary_union
+        overlaps[i] = geom.intersection(local_union).length
 
+    edges["grid"] = (
+        np.where(edge_len > 0, overlaps / edge_len, 0.0) >= 0.50
+    ).astype(int)
+    return edges
+
+
+def _process_state(abbrev: str, project_dir: Path, is_training: bool = False) -> None:
     paths = {**get_state_paths(abbrev), **get_project_paths(abbrev, project_dir)}
 
+    suffix = "training" if is_training else "prediction"
+    extent_file = "training_extent.gpkg" if is_training else "prediction_extent.gpkg"
+
     print(f"\n{'='*60}")
-    print(f" Edge/Path Pipeline — {STATE_FULL_NAMES[abbrev]} ({abbrev})")
-    print(f" Project: {args.project}")
+    print(f" Edge/Path Pipeline — {STATE_FULL_NAMES[abbrev]} ({abbrev})  [{suffix}]")
+    print(f" Project: {project_dir.name}")
     print(f"{'='*60}")
 
     # ------------------------------------------------------------------
@@ -864,18 +879,27 @@ def main() -> None:
     print(f"  {len(edges):,} edges loaded")
 
     # ------------------------------------------------------------------
-    # 1b. Clip to prediction extent
+    # 1b. Clip to extent
     # ------------------------------------------------------------------
-    extent_path = project_dir / "prediction_extent.gpkg"
+    extent_path = project_dir / extent_file
     if extent_path.exists():
-        print(f"\n[1b] Clipping to prediction extent...")
+        print(f"\n[1b] Clipping to {extent_file}...")
         extent = gpd.read_file(extent_path).to_crs(METRIC_CRS)
         extent_union = extent.geometry.union_all()
+        grid_range = load_geo(
+            BASE_DIR / "grid_ranges" / "3_phase" / f"{abbrev}_3phase_range.parquet", METRIC_CRS
+        )
+        if is_training:
+            if grid_range is not None and not grid_range.empty:
+                extent_union = extent_union.intersection(grid_range.geometry.unary_union)
+        elif EXCLUDE_GRID_FROM_PREDICTION:
+            if grid_range is not None and not grid_range.empty:
+                extent_union = extent_union.difference(grid_range.geometry.unary_union)
         edges = edges[edges.geometry.intersects(extent_union)].copy()
         edges = gpd.clip(edges, extent_union)
         print(f"  {len(edges):,} edges after clipping")
     else:
-        print(f"\n[1b] No prediction_extent.gpkg in {project_dir} — using all edges")
+        print(f"\n[1b] No {extent_file} in {project_dir} — using all edges")
 
     # ------------------------------------------------------------------
     # 2. Build network graph
@@ -1046,12 +1070,19 @@ def main() -> None:
     edges_out = compute_edge_features(edges_out, paths)
 
     # ------------------------------------------------------------------
+    # 10b. Grid binary (training only)
+    # ------------------------------------------------------------------
+    if is_training:
+        print("\n[10b] Computing grid binary...")
+        edges_out = compute_grid(edges_out, paths)
+
+    # ------------------------------------------------------------------
     # 11. Save
     # ------------------------------------------------------------------
     print("\n[11] Saving edges_clean...")
     out_dir = project_dir / "edges"
     out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / f"{abbrev}_edges_clean.gpkg"
+    out = out_dir / f"{abbrev}_edges_{suffix}.gpkg"
     edges_out.to_crs(FINAL_CRS).to_file(out, driver="GPKG")
 
     used_any   = sum(new_cols["is_used_by_any_path"])
@@ -1065,5 +1096,35 @@ def main() -> None:
     print(f"{'='*60}\n")
 
 
+def main() -> None:
+    project_dir = BASE_DIR / PROJECT
+
+    print("\n" + "=" * 60)
+    print("PREDICTION EDGES")
+    print("=" * 60)
+    for state in PREDICTION_STATES:
+        abbrev = _NAME_TO_ABBREV.get(state, state)
+        _process_state(abbrev, project_dir, is_training=False)
+
+    print("\n" + "=" * 60)
+    print("TRAINING EDGES")
+    print("=" * 60)
+    for state in TRAINING_STATES:
+        abbrev = _NAME_TO_ABBREV.get(state, state)
+        _process_state(abbrev, project_dir, is_training=True)
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Generate edge/path features for prediction and training states.")
+    parser.add_argument("--project", default=PROJECT,          help="Project folder name (default: %(default)s)")
+    parser.add_argument("--predict", nargs="+", default=PREDICTION_STATES, metavar="STATE", help="State(s) for prediction edges")
+    parser.add_argument("--train",   nargs="+", default=TRAINING_STATES,   metavar="STATE", help="State(s) for training edges")
+    parser.add_argument("--exclude-grid-from-prediction", action="store_true", help="Exclude 3-phase grid range from prediction extent")
+    args = parser.parse_args()
+
+    PROJECT                      = args.project
+    PREDICTION_STATES            = args.predict
+    TRAINING_STATES              = args.train
+    EXCLUDE_GRID_FROM_PREDICTION = args.exclude_grid_from_prediction
+
     main()

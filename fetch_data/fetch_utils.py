@@ -94,7 +94,7 @@ class BaseConfig:
         self.state_slug   = state_name.replace(" ", "_").lower()
         self.crs_metric   = STATE_CRS[state_name]
 
-        script_dir       = Path(__file__).parent
+        script_dir       = Path(__file__).parent.parent
         self.output_root = script_dir / "raw_data" / self.state_abbrev
 
     def s3_uri(self, key_name: str) -> str:
@@ -128,13 +128,33 @@ class S3Reader:
         return self._client
 
     def read_parquet(self, s3_uri: str) -> gpd.GeoDataFrame | None:
-        """Reads a geoparquet directly from S3 via s3fs."""
+        """Reads a parquet from S3, handling both GeoParquet and plain Parquet."""
+        import pandas as pd
+        logger.debug(f"  read_parquet: {s3_uri}")
         try:
-            logger.debug(f"  read_parquet: {s3_uri}")
             return gpd.read_parquet(s3_uri)
+        except Exception:
+            pass
+        try:
+            df = pd.read_parquet(s3_uri)
         except Exception as e:
             logger.warning(f"  [Skip] {s3_uri.rsplit('/', 1)[-1]}: {e}")
             return None
+        # Try to find a geometry column and convert
+        for col in df.columns:
+            if col.lower() in ("geometry", "geom", "shape"):
+                try:
+                    sample = df[col].iloc[0]
+                    if isinstance(sample, (bytes, bytearray)):
+                        geom_series = gpd.GeoSeries.from_wkb(df[col])
+                    else:
+                        geom_series = gpd.GeoSeries.from_wkt(df[col])
+                    return gpd.GeoDataFrame(df, geometry=geom_series)
+                except Exception as e:
+                    logger.warning(f"  [Skip] {s3_uri.rsplit('/', 1)[-1]}: could not parse geometry column '{col}': {e}")
+                    return None
+        logger.warning(f"  [Skip] {s3_uri.rsplit('/', 1)[-1]}: no geometry column found in plain Parquet")
+        return None
 
     def download_temp(self, s3_uri: str, suffix: str = "") -> Path | None:
         """Downloads an S3 object to a local temp file; caller must unlink."""
@@ -211,7 +231,12 @@ class GeoUtils:
             return None
         try:
             if gdf.crs is None:
-                gdf = gdf.set_crs(self.cfg.CRS_LATLON)
+                bounds = gdf.total_bounds  # minx, miny, maxx, maxy
+                if abs(bounds[0]) > 180 or abs(bounds[2]) > 180:
+                    # Coordinates are projected — assume state metric CRS
+                    gdf = gdf.set_crs(self.cfg.crs_metric)
+                else:
+                    gdf = gdf.set_crs(self.cfg.CRS_LATLON)
             gdf = gdf.to_crs(self.cfg.crs_metric)
             result = gpd.clip(gdf, mask)
             if result.empty:

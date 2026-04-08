@@ -42,6 +42,7 @@ import argparse
 import warnings
 from pathlib import Path
 
+import boto3
 import geopandas as gpd
 import numpy as np
 import pandas as pd
@@ -49,12 +50,12 @@ import rasterio
 from rasterio.transform import rowcol
 from scipy.ndimage import distance_transform_edt
 from scipy.spatial import cKDTree
-from shapely.geometry import Point, MultiPoint, box as shpbox
+from shapely.geometry import Point, MultiPoint
 from sklearn.cluster import HDBSCAN
 from sklearn.metrics import accuracy_score, roc_auc_score, f1_score
 import xgboost as xgb
 
-from generate_utils import (
+from .generate_utils import (
     METRIC_CRS, FINAL_CRS, BASE_DIR, STATE_FULL_NAMES, _NAME_TO_ABBREV,
     CDL_3PHASE_CODES, NLCD_DEVELOPED, NLCD_NATURE, NLCD_CROPS,
     _find, load_geo,
@@ -62,20 +63,38 @@ from generate_utils import (
 
 warnings.filterwarnings("ignore")
 
+_STATE_BORDERS_S3    = "s3://grid-research-raw-data/USA/state borders/cb_2023_us_state_20m.gpkg"
+_STATE_BORDERS_LOCAL = BASE_DIR / "raw_data" / "_shared" / "cb_2023_us_state_20m.gpkg"
+
+
+def _ensure_state_borders() -> Path:
+    if not _STATE_BORDERS_LOCAL.exists():
+        _STATE_BORDERS_LOCAL.parent.mkdir(parents=True, exist_ok=True)
+        bucket, key = _STATE_BORDERS_S3[5:].split("/", 1)
+        boto3.client("s3").download_file(bucket, key, str(_STATE_BORDERS_LOCAL))
+    return _STATE_BORDERS_LOCAL
+
+
+def get_state_border_geom(state: str):
+    states = gpd.read_file(_ensure_state_borders())
+    name = STATE_FULL_NAMES[state]
+    border = states[states["NAME"] == name].to_crs(METRIC_CRS)
+    return border.geometry.unary_union
+
 
 # ==========================================
 #               CONFIGURATION
 # ==========================================
 
-# ---- Training sampling ----
-N_GRID_SAMPLES = 12_000
-N_ROAD_SAMPLES = 12_000
-N_BG_SAMPLES   =  8_000
+# ---- Training sampling (per 1,000 sq km of training area) ----
+N_GRID_SAMPLES_PER_1K_KM2 = 850
+N_ROAD_SAMPLES_PER_1K_KM2 = 850
+N_BG_SAMPLES_PER_1K_KM2   = 600
 
 # ---- Dynamic buffer (scales with building density) ----
 DENSITY_RADIUS_M       = 1_000
-BUFFER_URBAN_M         =   120
-BUFFER_RURAL_M         =   550
+BUFFER_URBAN_M         =   100
+BUFFER_RURAL_M         =   450
 DENSITY_THRESHOLD_HIGH =   600   # buildings within 1 km → fully urban
 
 # ---- Prediction candidate grid ----
@@ -100,22 +119,27 @@ XGB_PARAMS = {
 }
 
 # ---- Clustering ----
-PROB_THRESHOLD        = 0.56   # grid clusters: high probability
+PROB_THRESHOLD        = 0.58   # grid clusters: high probability
 MINOR_PROB_THRESHOLD  = 0.42   # minor clusters: moderate probability
 MAX_PROB_ANTI         = 0.10   # anti-clusters: low probability
 MIN_CLUSTER_SIZE      = 2
 MIN_SAMPLES_CLUSTER   = 5
 MIN_SAMPLES_ANTI      = 2
 HULL_RATIO            = 0.25
-CLUSTER_FALLBACK_BUF  = 150    # expand degenerate cluster hulls
+CLUSTER_FALLBACK_BUF  = 150    # expand degenerate cluster hulls (small_buf)
+CLUSTER_HULL_FALLBACK = 600    # buffer for fully-failed concave hull (fallback_buf)
 ANTI_FALLBACK_BUF     = 500
 ANTI_SHRINK_M         = 150    # shrink anti-cluster hull inward
 ARTIFICIAL_BUF_M      = 100    # buffer around point/polygon features for artificial clusters
 
-# ---- Spatial CV ----
-PARTITION_GRID_SIZE_M = 15_000
+# ---- Model training ----
+VALIDATION_SPLIT = 0.2   # fraction of training points held out for early stopping
 
 PROJECT = "project-ma"
+PREDICTION_STATES = ["MA"]
+TRAINING_STATES   = ["MA"]
+FORCE = False
+EXCLUDE_GRID_FROM_PREDICTION = False  # subtract 3-phase grid range from prediction extent
 
 # Infrastructure tasks: key → list of actions in ["dist", "count", "area"]
 INFRA_TASKS: dict[str, list[str]] = {
@@ -150,8 +174,8 @@ COMPOSITE_LAYERS = {
 
 EXCLUDE_COLS = {
     "geometry", "source", "index_right", "index_left",
-    "id", "group_id", "part_label", "grid", "fold_id",
-    "dynamic_threshold", "bldg_count_1km",
+    "id", "grid",
+    "dist_to_grid", "dynamic_threshold", "bldg_count_1km",
 }
 
 
@@ -163,8 +187,9 @@ def get_state_paths(s: str) -> dict:
     raw = BASE_DIR / "raw_data" / s
     return {
         # Core area + grid lines
-        "training_range": BASE_DIR / "grid_ranges" / "3_phase" / f"{s}_3phase_range.parquet",
-        "grid_lines":     BASE_DIR / "grid_data"   / "3_phase" / f"{s}_3phase.parquet",
+        "training_range":     BASE_DIR / "grid_ranges" / "3_phase" / f"{s}_3phase_range.parquet",
+        "grid_range_parquet": BASE_DIR / "grid_ranges" / "3_phase" / f"{s}_3phase_range.parquet",
+        "grid_lines":         BASE_DIR / "grid_data"   / "3_phase" / f"{s}_3phase.parquet",
         # Specified by user
         "roads":          raw / "TRANSPORT" / f"{s}_roads_raw.gpkg",
         "buildings":      raw / "BUILDINGS" / f"{s}_fema_buildings.geojson",
@@ -217,17 +242,6 @@ def _dynamic_buffer(pts: gpd.GeoDataFrame, buildings: gpd.GeoDataFrame) -> np.nd
     )
     return np.interp(counts, [0, DENSITY_THRESHOLD_HIGH], [BUFFER_RURAL_M, BUFFER_URBAN_M])
 
-
-def _make_partition_grid(extent_bounds: tuple) -> gpd.GeoDataFrame:
-    """15 km tiles over a bounding box for spatial CV."""
-    minx, miny, maxx, maxy = extent_bounds
-    cells, ids = [], []
-    i = 0
-    for x in np.arange(minx, maxx, PARTITION_GRID_SIZE_M):
-        for y in np.arange(miny, maxy, PARTITION_GRID_SIZE_M):
-            cells.append(shpbox(x, y, x + PARTITION_GRID_SIZE_M, y + PARTITION_GRID_SIZE_M))
-            ids.append(i); i += 1
-    return gpd.GeoDataFrame({"geometry": cells, "group_id": ids}, crs=METRIC_CRS)
 
 
 def _grid_points(zone_geom, res: int) -> gpd.GeoDataFrame:
@@ -300,20 +314,28 @@ def generate_training_points(paths: dict) -> gpd.GeoDataFrame:
 
     range_union = training_range.geometry.unary_union
     if exclusions is not None and not exclusions.empty:
-        range_union = range_union.difference(exclusions.geometry.unary_union)
+        excl_geom = exclusions.geometry.make_valid()
+        range_union = range_union.difference(excl_geom.unary_union)
     valid_gdf = gpd.GeoDataFrame(geometry=[range_union], crs=METRIC_CRS)
 
+    area_km2 = range_union.area / 1e6
+    scale    = area_km2 / 1_000
+    n_grid   = max(100, int(N_GRID_SAMPLES_PER_1K_KM2 * scale))
+    n_road   = max(100, int(N_ROAD_SAMPLES_PER_1K_KM2 * scale))
+    n_bg     = max(100, int(N_BG_SAMPLES_PER_1K_KM2   * scale))
+    print(f"   training area: {area_km2:,.0f} km²  →  grid={n_grid:,}  road={n_road:,}  bg={n_bg:,}")
+
     # Sample near grid lines, near roads, background
-    s_grid        = _sample_near_lines(grid_lines, N_GRID_SAMPLES, BUFFER_RURAL_M)
+    s_grid        = _sample_near_lines(grid_lines, n_grid, BUFFER_RURAL_M)
     s_grid["source"] = "near_grid"
 
     if roads is not None and not roads.empty:
-        s_roads = _sample_near_lines(roads, N_ROAD_SAMPLES, BUFFER_RURAL_M)
+        s_roads = _sample_near_lines(roads, n_road, BUFFER_RURAL_M)
         s_roads["source"] = "near_road"
     else:
         s_roads = gpd.GeoDataFrame(columns=["geometry", "source"], crs=METRIC_CRS)
 
-    s_bg = _sample_random_in_polygon(range_union, N_BG_SAMPLES)
+    s_bg = _sample_random_in_polygon(range_union, n_bg)
     s_bg["source"] = "background"
 
     all_pts = gpd.GeoDataFrame(
@@ -433,7 +455,8 @@ def _road_length_by_type(pts: gpd.GeoDataFrame, roads: gpd.GeoDataFrame | None) 
     buf_gdf["buffer_geom"] = pts.geometry.buffer(pts["dynamic_buffer_size"])
     buf_gdf = buf_gdf.set_geometry("buffer_geom")
     type_col = "new_class" if "new_class" in roads.columns else "highway"
-    joined  = gpd.sjoin(roads[[type_col, "geometry"]], buf_gdf[["geometry"]], how="inner", predicate="intersects")
+    join_right = gpd.GeoDataFrame(geometry=buf_gdf["buffer_geom"], crs=buf_gdf.crs)
+    joined  = gpd.sjoin(roads[[type_col, "geometry"]], join_right, how="inner", predicate="intersects")
     joined  = joined.join(buf_gdf["buffer_geom"], on="index_right", rsuffix="_buf")
     joined["seg_len"] = joined.geometry.intersection(joined["buffer_geom"]).length
     pivoted = joined.pivot_table(
@@ -649,13 +672,6 @@ def assign_features(pts: gpd.GeoDataFrame, paths: dict) -> gpd.GeoDataFrame:
     else:
         pts["bldg_median_m2"] = pts["bldg_std_m2"] = pts["bldg_area_per_km2"] = 0.0
 
-    # ---- Road length by type ----
-    print("\n  [roads by type]")
-    roads = load_geo(paths.get("roads"), METRIC_CRS)
-    road_feats = _road_length_by_type(pts, roads)
-    pts = pts.join(road_feats)
-    for c in [col for col in pts.columns if col.startswith("road_len_")]:
-        pts[c] = pts[c].fillna(0.0)
 
     # ---- NLCD (dual radius) ----
     print("\n  [NLCD dual radius]")
@@ -709,8 +725,12 @@ def generate_prediction_candidates(paths: dict) -> gpd.GeoDataFrame:
     exclusions = load_geo(paths["exclusions"], METRIC_CRS)
 
     valid_area = area_gdf.geometry.unary_union
+    if EXCLUDE_GRID_FROM_PREDICTION:
+        grid_range = load_geo(paths.get("grid_range_parquet"), METRIC_CRS)
+        if grid_range is not None and not grid_range.empty:
+            valid_area = valid_area.difference(grid_range.geometry.unary_union)
     if exclusions is not None and not exclusions.empty:
-        valid_area = valid_area.difference(exclusions.geometry.unary_union)
+        valid_area = valid_area.difference(exclusions.geometry.make_valid().unary_union)
 
     road_buf = roads.geometry.buffer(BUF_ROAD_M).unary_union \
         if roads is not None and not roads.empty else None
@@ -794,77 +814,47 @@ def train_and_predict(
     pred_pts:  gpd.GeoDataFrame,
 ) -> gpd.GeoDataFrame:
     """
-    Spatial k-fold CV: each 15 km tile is held out once.
-    Trains on the rest, predicts grid_prob for prediction candidates in that tile.
+    Train one XGBoost model on all training points (20% random validation split
+    for early stopping), then apply it to all prediction candidates.
     """
     print("\n[Phase 5] Training XGBoost + predicting...")
 
-    # 15 km partition grid over the training area bounding box
-    part_grid = _make_partition_grid(tuple(train_pts.geometry.total_bounds))
+    from sklearn.model_selection import train_test_split
 
-    def assign_folds(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-        joined = gpd.sjoin(gdf, part_grid[["geometry", "group_id"]],
-                           how="left", predicate="intersects")
-        joined = joined[~joined.index.duplicated(keep="first")]
-        joined["group_id"] = joined["group_id"].fillna(-1).astype(int)
-        return joined.reset_index(drop=True)
+    X = _feature_engineering(train_pts)
+    y = train_pts["grid"].astype(int)
 
-    train_pts = assign_folds(train_pts)
-    pred_pts  = assign_folds(pred_pts)
-    pred_pts["grid_prob"] = np.nan
+    X_train, X_valid, y_train, y_valid = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
 
-    folds        = sorted(f for f in part_grid["group_id"].unique() if f >= 0)
-    fold_metrics = []
+    pos   = y_train.sum(); neg = len(y_train) - pos
+    scale = neg / pos if pos > 0 else 1.0
 
-    for holdout_id in folds:
-        train_sub  = train_pts[train_pts["group_id"] != holdout_id]
-        valid_sub  = train_pts[train_pts["group_id"] == holdout_id]
-        target_sub = pred_pts[pred_pts["group_id"]  == holdout_id]
+    model = xgb.XGBClassifier(
+        scale_pos_weight=scale,
+        n_estimators=5000,
+        early_stopping_rounds=50,
+        **XGB_PARAMS,
+    )
+    model.fit(X_train, y_train, eval_set=[(X_valid, y_valid)], verbose=False)
 
-        if len(train_sub) == 0 or len(valid_sub) == 0:
-            continue
+    val_probs       = model.predict_proba(X_valid)[:, 1]
+    best_t, best_f1 = _best_threshold(y_valid, val_probs)
+    val_preds       = (val_probs >= best_t).astype(int)
+    acc = accuracy_score(y_valid, val_preds)
+    auc = roc_auc_score(y_valid, val_probs)
+    print(f"  Val — Acc={acc:.3f}  AUC={auc:.3f}  F1={best_f1:.3f}  thresh={best_t:.2f}")
+    print(f"  Trees used: {model.best_iteration + 1}")
 
-        X_train = _feature_engineering(train_sub);  y_train = train_sub["grid"].astype(int)
-        X_valid = _feature_engineering(valid_sub);   y_valid = valid_sub["grid"].astype(int)
+    X_pred = _feature_engineering(pred_pts)
+    for c in set(X_train.columns) - set(X_pred.columns):
+        X_pred[c] = 0.0
+    X_pred = X_pred[X_train.columns]
 
-        for c in set(X_train.columns) - set(X_valid.columns):
-            X_valid[c] = 0.0
-        X_valid = X_valid[X_train.columns]
-
-        pos   = y_train.sum(); neg = len(y_train) - pos
-        scale = neg / pos if pos > 0 else 1.0
-
-        model = xgb.XGBClassifier(
-            scale_pos_weight=scale,
-            n_estimators=5000,
-            early_stopping_rounds=50,
-            **XGB_PARAMS,
-        )
-        model.fit(X_train, y_train, eval_set=[(X_valid, y_valid)], verbose=False)
-
-        val_probs        = model.predict_proba(X_valid)[:, 1]
-        best_t, best_f1  = _best_threshold(y_valid, val_probs)
-        val_preds        = (val_probs >= best_t).astype(int)
-        acc  = accuracy_score(y_valid, val_preds)
-        auc  = roc_auc_score(y_valid, val_probs)
-        print(f"  [Fold {holdout_id:>3}] Acc={acc:.3f}  AUC={auc:.3f}"
-              f"  F1={best_f1:.3f}  thresh={best_t:.2f}")
-        fold_metrics.append({"fold": holdout_id, "acc": acc, "auc": auc,
-                              "f1": best_f1, "thresh": best_t})
-
-        if len(target_sub) > 0:
-            X_target = _feature_engineering(target_sub)
-            for c in set(X_train.columns) - set(X_target.columns):
-                X_target[c] = 0.0
-            X_target = X_target[X_train.columns]
-            pred_pts.loc[target_sub.index, "grid_prob"] = model.predict_proba(X_target)[:, 1]
-
-    if fold_metrics:
-        m = pd.DataFrame(fold_metrics)
-        print(f"\n  CV — Avg Acc={m['acc'].mean():.3f}  AUC={m['auc'].mean():.3f}"
-              f"  F1={m['f1'].mean():.3f}  thresh={m['thresh'].mean():.2f}")
-
-    return pred_pts.dropna(subset=["grid_prob"]).reset_index(drop=True)
+    pred_pts = pred_pts.copy()
+    pred_pts["grid_prob"] = model.predict_proba(X_pred)[:, 1]
+    return pred_pts.reset_index(drop=True)
 
 
 # ==========================================
@@ -932,7 +922,7 @@ def generate_cluster_polygons(pred_pts: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
             "n_solar":       int(cc.get("solar",       0)),
             "n_residential": int(cc.get("residential", 0)),
             "geometry":      _hull(MultiPoint(grp.geometry.tolist()),
-                                   CLUSTER_FALLBACK_BUF, 600),
+                                   CLUSTER_FALLBACK_BUF, CLUSTER_HULL_FALLBACK),
         })
     return gpd.GeoDataFrame(rows, crs=METRIC_CRS)
 
@@ -1034,7 +1024,7 @@ def generate_minor_cluster_polygons(
                 "n_residential":  int(cc.get("residential", 0)),
                 "source":         "model",
                 "geometry":       _hull(MultiPoint(grp.geometry.tolist()),
-                                        CLUSTER_FALLBACK_BUF, 600),
+                                        CLUSTER_FALLBACK_BUF, CLUSTER_HULL_FALLBACK),
             })
         minor_model = gpd.GeoDataFrame(rows, crs=METRIC_CRS) if rows \
             else gpd.GeoDataFrame(columns=["geometry"], crs=METRIC_CRS)
@@ -1129,43 +1119,31 @@ def generate_minor_cluster_polygons(
 #                  MAIN
 # ==========================================
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Cluster pipeline — training → features → model → polygons.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Examples:\n"
-            "  python generate-clusters.py Massachusetts\n"
-            "  python generate-clusters.py MA --force\n"
-            "  python generate-clusters.py MA --project project-ma --force\n"
-        ),
-    )
-    parser.add_argument("state", help="Full state name or 2-letter abbreviation")
-    parser.add_argument("--project", default=PROJECT,
-                        help="Project folder name (default: %(default)s)")
-    parser.add_argument(
-        "--force", "-f", action="store_true",
-        help="Rerun all steps even if intermediate outputs already exist",
-    )
-    args = parser.parse_args()
-
-    abbrev = _NAME_TO_ABBREV.get(args.state.strip())
-    if abbrev is None:
-        print(f"[ERROR] Unknown state: '{args.state}'")
-        print(f"  Known: {', '.join(sorted(STATE_FULL_NAMES.keys()))}")
-        return
-
-    project_dir = BASE_DIR / args.project
-    if not project_dir.exists():
-        print(f"[ERROR] Project folder not found: {project_dir}")
-        return
-
+def _process_state(abbrev: str, project_dir: Path, force: bool = False) -> None:
     paths = get_state_paths(abbrev)
 
-    # Inject project prediction_extent into paths
-    extent_path = project_dir / "prediction_extent.gpkg"
-    if extent_path.exists():
-        paths["prediction_extent"] = extent_path
+    state_border = get_state_border_geom(abbrev)
+
+    training_extent_path = project_dir / "training_extent.gpkg"
+    if training_extent_path.exists():
+        te = gpd.read_file(training_extent_path).to_crs(METRIC_CRS)
+        te_clipped = te.geometry.unary_union.intersection(state_border)
+        grid_range = load_geo(
+            BASE_DIR / "grid_ranges" / "3_phase" / f"{abbrev}_3phase_range.parquet", METRIC_CRS
+        )
+        if grid_range is not None and not grid_range.empty:
+            te_clipped = te_clipped.intersection(grid_range.geometry.unary_union)
+        te_gdf = gpd.GeoDataFrame(geometry=[te_clipped], crs=METRIC_CRS)
+        paths["training_range"] = te_gdf
+    else:
+        print(f"  [warn] No training_extent.gpkg in {project_dir} — using grid training_range")
+
+    prediction_extent_path = project_dir / "prediction_extent.gpkg"
+    if prediction_extent_path.exists():
+        pe = gpd.read_file(prediction_extent_path).to_crs(METRIC_CRS)
+        pe_clipped = pe.geometry.unary_union.intersection(state_border)
+        pe_gdf = gpd.GeoDataFrame(geometry=[pe_clipped], crs=METRIC_CRS)
+        paths["prediction_extent"] = pe_gdf
     else:
         print(f"  [warn] No prediction_extent.gpkg in {project_dir} — using training_range")
 
@@ -1174,57 +1152,57 @@ def main() -> None:
 
     print(f"\n{'='*60}")
     print(f" Cluster Pipeline — {STATE_FULL_NAMES[abbrev]} ({abbrev})")
-    print(f" Project : {args.project}")
+    print(f" Project : {project_dir.name}")
     print(f" Output  : {out}")
     print(f"{'='*60}")
 
-    p_train_feats = out / f"{abbrev}_training_features.parquet"
-    p_pred_feats  = out / f"{abbrev}_prediction_features.parquet"
-    p_predicted   = out / f"{abbrev}_points_predicted.parquet"
-    p_clusters    = out / f"{abbrev}_cluster_polygons.geojson"
-    p_clusters_minor = out / f"{abbrev}_cluster_polygons_minor.geojson"
-    p_anti        = out / f"{abbrev}_anti_cluster_polygons.geojson"
+    p_train_feats    = out / f"{abbrev}_training_features.gpkg"
+    p_pred_feats     = out / f"{abbrev}_prediction_features.gpkg"
+    p_predicted      = out / f"{abbrev}_points_predicted.gpkg"
+    p_clusters       = out / f"{abbrev}_cluster_polygons.gpkg"
+    p_clusters_minor = out / f"{abbrev}_cluster_polygons_minor.gpkg"
+    p_anti           = out / f"{abbrev}_anti_cluster_polygons.gpkg"
 
     # ---- Phases 1 + 2: training points + features ----
-    if not args.force and p_train_feats.exists():
+    if not force and p_train_feats.exists():
         print(f"\n[cached] {p_train_feats.name} — loading (--force to rerun)")
-        train_pts = gpd.read_parquet(p_train_feats).to_crs(METRIC_CRS)
+        train_pts = gpd.read_file(p_train_feats).to_crs(METRIC_CRS)
     else:
         train_pts = generate_training_points(paths)
         print("\n[Phase 2] Assigning features to training points...")
         train_pts = assign_features(train_pts, paths)
-        train_pts.to_parquet(p_train_feats, index=False)
+        train_pts.to_crs(FINAL_CRS).to_file(p_train_feats, driver="GPKG")
         print(f"  saved → {p_train_feats.name}")
 
     # ---- Phases 3 + 4: prediction candidates + features ----
-    if not args.force and p_pred_feats.exists():
+    if not force and p_pred_feats.exists():
         print(f"\n[cached] {p_pred_feats.name} — loading (--force to rerun)")
-        pred_pts = gpd.read_parquet(p_pred_feats).to_crs(METRIC_CRS)
+        pred_pts = gpd.read_file(p_pred_feats).to_crs(METRIC_CRS)
     else:
         pred_pts = generate_prediction_candidates(paths)
         print("\n[Phase 4] Assigning features to prediction candidates...")
         pred_pts = assign_features(pred_pts, paths)
-        pred_pts.to_parquet(p_pred_feats, index=False)
+        pred_pts.to_crs(FINAL_CRS).to_file(p_pred_feats, driver="GPKG")
         print(f"  saved → {p_pred_feats.name}")
 
     # ---- Phase 5: train + predict ----
     pred_pts = train_and_predict(train_pts, pred_pts)
-    pred_pts.to_parquet(p_predicted, index=False)
+    pred_pts.to_crs(FINAL_CRS).to_file(p_predicted, driver="GPKG")
     print(f"\n  saved → {p_predicted.name}  ({len(pred_pts):,} points with grid_prob)")
 
     # ---- Phase 6: cluster polygons ----
     clusters = generate_cluster_polygons(pred_pts)
-    clusters.to_crs(FINAL_CRS).to_file(p_clusters, driver="GeoJSON")
+    clusters.to_crs(FINAL_CRS).to_file(p_clusters, driver="GPKG")
     print(f"  saved → {p_clusters.name}  ({len(clusters)} clusters)")
 
     # ---- Phase 7: anti-cluster polygons ----
     anti = generate_anti_cluster_polygons(pred_pts)
-    anti.to_crs(FINAL_CRS).to_file(p_anti, driver="GeoJSON")
+    anti.to_crs(FINAL_CRS).to_file(p_anti, driver="GPKG")
     print(f"  saved → {p_anti.name}  ({len(anti)} anti-clusters)")
 
     # ---- Phase 8: minor cluster polygons ----
     minor = generate_minor_cluster_polygons(pred_pts, clusters, paths)
-    minor.to_crs(FINAL_CRS).to_file(p_clusters_minor, driver="GeoJSON")
+    minor.to_crs(FINAL_CRS).to_file(p_clusters_minor, driver="GPKG")
     print(f"  saved → {p_clusters_minor.name}  ({len(minor)} minor clusters)")
 
     print(f"\n{'='*60}")
@@ -1232,5 +1210,37 @@ def main() -> None:
     print(f"{'='*60}\n")
 
 
+def main() -> None:
+    project_dir = BASE_DIR / PROJECT
+
+    print("\n" + "=" * 60)
+    print("PREDICTION CLUSTERS")
+    print("=" * 60)
+    for state in PREDICTION_STATES:
+        abbrev = _NAME_TO_ABBREV.get(state, state)
+        _process_state(abbrev, project_dir, force=FORCE)
+
+    print("\n" + "=" * 60)
+    print("TRAINING CLUSTERS")
+    print("=" * 60)
+    for state in TRAINING_STATES:
+        abbrev = _NAME_TO_ABBREV.get(state, state)
+        _process_state(abbrev, project_dir, force=FORCE)
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Cluster pipeline — training → features → model → polygons.")
+    parser.add_argument("--project", default=PROJECT,           help="Project folder name (default: %(default)s)")
+    parser.add_argument("--predict", nargs="+", default=PREDICTION_STATES, metavar="STATE", help="State(s) for prediction clusters")
+    parser.add_argument("--train",   nargs="+", default=TRAINING_STATES,   metavar="STATE", help="State(s) for training clusters")
+    parser.add_argument("--force", "-f", action="store_true",   help="Rerun all steps even if intermediate outputs already exist")
+    parser.add_argument("--exclude-grid-from-prediction", action="store_true", help="Exclude 3-phase grid range from prediction extent")
+    args = parser.parse_args()
+
+    PROJECT                      = args.project
+    PREDICTION_STATES            = args.predict
+    TRAINING_STATES              = args.train
+    FORCE                        = args.force
+    EXCLUDE_GRID_FROM_PREDICTION = args.exclude_grid_from_prediction
+
     main()
