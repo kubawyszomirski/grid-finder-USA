@@ -87,9 +87,10 @@ def get_state_border_geom(state: str):
 # ==========================================
 
 # ---- Training sampling (per 1,000 sq km of training area) ----
-N_GRID_SAMPLES_PER_1K_KM2 = 850
-N_ROAD_SAMPLES_PER_1K_KM2 = 850
-N_BG_SAMPLES_PER_1K_KM2   = 600
+N_GRID_SAMPLES_PER_1K_KM2 = 800
+N_ROAD_SAMPLES_PER_1K_KM2 = 800
+N_BG_SAMPLES_PER_1K_KM2   = 500
+TRAINING_POINT_MULTIPLIER  = 1.5    # scale all sampling counts without changing ratios
 
 # ---- Dynamic buffer (scales with building density) ----
 DENSITY_RADIUS_M       = 1_000
@@ -119,12 +120,13 @@ XGB_PARAMS = {
 }
 
 # ---- Clustering ----
-PROB_THRESHOLD        = 0.58   # grid clusters: high probability
-MINOR_PROB_THRESHOLD  = 0.42   # minor clusters: moderate probability
-MAX_PROB_ANTI         = 0.10   # anti-clusters: low probability
+PROB_THRESHOLD        = 0.89   # grid clusters: high probability
+MINOR_PROB_THRESHOLD  = 0.65   # minor clusters: moderate probability
+MAX_PROB_ANTI         = 0.08   # anti-clusters: low probability
 MIN_CLUSTER_SIZE      = 2
+MIN_CLUSTER_SIZE_ANTI = 5
 MIN_SAMPLES_CLUSTER   = 5
-MIN_SAMPLES_ANTI      = 2
+MIN_SAMPLES_ANTI      = 10
 HULL_RATIO            = 0.25
 CLUSTER_FALLBACK_BUF  = 150    # expand degenerate cluster hulls (small_buf)
 CLUSTER_HULL_FALLBACK = 600    # buffer for fully-failed concave hull (fallback_buf)
@@ -216,9 +218,11 @@ def get_state_paths(s: str) -> dict:
         "substations":                _find(raw / "SUBSTATIONS", f"{s}_substations_final"),
         "dams":                       _find(raw / "TRANSPORT",   f"{s}_dams_major"),
         "transmission_lines":         _find(raw / "GRID",        f"{s}_transmission_lines"),
+        "osm_distribution_lines":     _find(raw / "GRID",        f"{s}_osm_distribution_lines"),
         # Land vectors
-        "wetlands": _find(raw / "LAND", f"{s}_wetlands"),
-        "vrm":      _find(raw / "LAND", f"{s}_vrm"),
+        "wetlands":        _find(raw / "LAND", f"{s}_wetlands"),
+        "vrm":             _find(raw / "LAND", f"{s}_vrm"),
+        "dso_boundaries":  _find(raw / "LAND", f"{s}_dso_boundaries"),
         # Rasters
         "cdl":   raw / "LAND" / f"{s}_cdl.tif",
         "nlcd":  raw / "LAND" / f"{s}_nlcd.tif",
@@ -320,9 +324,9 @@ def generate_training_points(paths: dict) -> gpd.GeoDataFrame:
 
     area_km2 = range_union.area / 1e6
     scale    = area_km2 / 1_000
-    n_grid   = max(100, int(N_GRID_SAMPLES_PER_1K_KM2 * scale))
-    n_road   = max(100, int(N_ROAD_SAMPLES_PER_1K_KM2 * scale))
-    n_bg     = max(100, int(N_BG_SAMPLES_PER_1K_KM2   * scale))
+    n_grid   = max(100, int(N_GRID_SAMPLES_PER_1K_KM2 * scale * TRAINING_POINT_MULTIPLIER))
+    n_road   = max(100, int(N_ROAD_SAMPLES_PER_1K_KM2 * scale * TRAINING_POINT_MULTIPLIER))
+    n_bg     = max(100, int(N_BG_SAMPLES_PER_1K_KM2   * scale * TRAINING_POINT_MULTIPLIER))
     print(f"   training area: {area_km2:,.0f} km²  →  grid={n_grid:,}  road={n_road:,}  bg={n_bg:,}")
 
     # Sample near grid lines, near roads, background
@@ -614,6 +618,35 @@ def _sample_lanid_dist(pts: gpd.GeoDataFrame, lanid_path: Path) -> list[float]:
     return dists
 
 
+def _dist_to_polygon_boundaries(pts: gpd.GeoDataFrame, polys: gpd.GeoDataFrame,
+                                 fallback: float = 99_999.0) -> np.ndarray:
+    """Distance from each point to the nearest polygon boundary edge (works for interior points too)."""
+    if polys is None or polys.empty:
+        return np.full(len(pts), fallback)
+    bounds = polys.geometry.boundary.explode(index_parts=False)
+    bounds = bounds[~bounds.is_empty].reset_index(drop=True)
+    if bounds.empty:
+        return np.full(len(pts), fallback)
+    # DSO has ~50 polygons, so iterating over pts and broadcasting distance is fast enough
+    return np.array([float(bounds.distance(pt).min()) for pt in pts.geometry])
+
+
+def _dist_to_lines(pts: gpd.GeoDataFrame, lines: gpd.GeoDataFrame,
+                   fallback: float = 99_999.0) -> np.ndarray:
+    """Distance from each point to the nearest line geometry (uses sindex for performance)."""
+    if lines is None or lines.empty:
+        return np.full(len(pts), fallback)
+    sindex = lines.sindex
+    result = []
+    for pt in pts.geometry:
+        # progressive buffer: try 5 km first, fall back to full dataset
+        cands = list(sindex.query(pt.buffer(5_000), predicate="intersects"))
+        if not cands:
+            cands = list(range(len(lines)))
+        result.append(float(lines.iloc[cands].distance(pt).min()))
+    return np.array(result)
+
+
 def assign_features(pts: gpd.GeoDataFrame, paths: dict) -> gpd.GeoDataFrame:
     """
     Compute all ML features for a set of points.
@@ -695,6 +728,18 @@ def assign_features(pts: gpd.GeoDataFrame, paths: dict) -> gpd.GeoDataFrame:
     print("\n  [wetlands / VRM]")
     pts["wetlands_pct"] = _fraction_in_dynamic_buf(pts, load_geo(paths.get("wetlands"), METRIC_CRS))
     pts["vrm_pct"]      = _fraction_in_dynamic_buf(pts, load_geo(paths.get("vrm"),      METRIC_CRS))
+
+    # ---- DSO boundary distance ----
+    print("\n  [DSO boundary distance]")
+    pts["dist_to_dso_boundary"] = _dist_to_polygon_boundaries(
+        pts, load_geo(paths.get("dso_boundaries"), METRIC_CRS)
+    )
+
+    # ---- OSM distribution lines distance ----
+    print("\n  [OSM distribution lines distance]")
+    pts["dist_to_osm_distribution_lines"] = _dist_to_lines(
+        pts, load_geo(paths.get("osm_distribution_lines"), METRIC_CRS)
+    )
 
     return pts
 
@@ -938,7 +983,7 @@ def generate_anti_cluster_polygons(pred_pts: gpd.GeoDataFrame) -> gpd.GeoDataFra
     valid = _classify_points(valid)
     coords = np.c_[valid.geometry.x, valid.geometry.y]
     valid["cluster_id"] = HDBSCAN(
-        min_cluster_size=2, min_samples=MIN_SAMPLES_ANTI, metric="euclidean"
+        min_cluster_size=MIN_CLUSTER_SIZE_ANTI, min_samples=MIN_SAMPLES_ANTI, metric="euclidean"
     ).fit_predict(coords)
 
     clustered = valid[valid["cluster_id"] != -1]
@@ -1048,6 +1093,10 @@ def generate_minor_cluster_polygons(
     all_rows: list[dict] = []
     next_id = 10_000   # artificial cluster IDs start here
 
+    pred_extent = paths.get("prediction_extent")
+    pred_extent_union = pred_extent.geometry.unary_union \
+        if pred_extent is not None and not pred_extent.empty else None
+
     # ---- Step 3: Artificial clusters — solar plants ----
     solar = load_geo(paths.get("solar"), METRIC_CRS)
     if solar is not None and not solar.empty:
@@ -1057,6 +1106,8 @@ def generate_minor_cluster_polygons(
             poly = geom if geom.geom_type in ("Polygon", "MultiPolygon") \
                 else geom.buffer(ARTIFICIAL_BUF_M)
             poly = poly.buffer(ARTIFICIAL_BUF_M)   # small margin around the plant
+            if pred_extent_union is not None and not poly.intersects(pred_extent_union):
+                continue
             if hdbscan_union is not None and poly.intersects(hdbscan_union):
                 continue
             all_rows.append({
@@ -1082,6 +1133,8 @@ def generate_minor_cluster_polygons(
             geom = row.geometry
             poly = geom.centroid.buffer(ARTIFICIAL_BUF_M) \
                 if geom.geom_type != "Point" else geom.buffer(ARTIFICIAL_BUF_M)
+            if pred_extent_union is not None and not poly.intersects(pred_extent_union):
+                continue
             if hdbscan_union is not None and poly.intersects(hdbscan_union):
                 continue
             all_rows.append({
