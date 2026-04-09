@@ -120,13 +120,14 @@ XGB_PARAMS = {
 }
 
 # ---- Clustering ----
-PROB_THRESHOLD        = 0.89   # grid clusters: high probability
-MINOR_PROB_THRESHOLD  = 0.65   # minor clusters: moderate probability
+PROB_THRESHOLD        = 0.80   # grid clusters: high probability
+MINOR_PROB_THRESHOLD  = 0.70   # minor clusters: moderate probability
 MAX_PROB_ANTI         = 0.08   # anti-clusters: low probability
-MIN_CLUSTER_SIZE      = 2
-MIN_CLUSTER_SIZE_ANTI = 5
-MIN_SAMPLES_CLUSTER   = 5
-MIN_SAMPLES_ANTI      = 10
+MIN_CLUSTER_SIZE          = 3
+MIN_CLUSTER_SIZE_ANTI     = 5
+MIN_SAMPLES_CLUSTER       = 5
+MIN_SAMPLES_ANTI          = 10
+CLUSTER_MERGE_DIST        = 60   # metres —merge leaf cluster polygons within this distance (0 = off)
 HULL_RATIO            = 0.25
 CLUSTER_FALLBACK_BUF  = 150    # expand degenerate cluster hulls (small_buf)
 CLUSTER_HULL_FALLBACK = 600    # buffer for fully-failed concave hull (fallback_buf)
@@ -924,6 +925,54 @@ def _classify_points(pts: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return pts
 
 
+def _merge_nearby_cluster_polygons(gdf: gpd.GeoDataFrame, merge_dist: float) -> gpd.GeoDataFrame:
+    """Union cluster polygons whose hulls are within merge_dist of each other, aggregating metadata.
+    merge_dist=0 merges only overlapping polygons."""
+    if len(gdf) <= 1:
+        return gdf
+
+    # Union-find over buffered geometries to get connected components
+    buffered = gdf.geometry.buffer(merge_dist / 2) if merge_dist > 0 else gdf.geometry
+    parent = list(range(len(gdf)))
+
+    def _find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    sindex = buffered.sindex
+    for i, geom in enumerate(buffered):
+        for j in sindex.query(geom, predicate="intersects"):
+            if j > i:
+                ri, rj = _find(i), _find(j)
+                if ri != rj:
+                    parent[ri] = rj
+
+    gdf = gdf.copy()
+    gdf["_group"] = [_find(i) for i in range(len(gdf))]
+    has_source = "source" in gdf.columns
+
+    rows = []
+    for _, grp in gdf.groupby("_group"):
+        mean_prob_val = pd.to_numeric(grp["mean_prob"], errors="coerce").mean()
+        row = {
+            "cluster_id":     int(grp["cluster_id"].iloc[0]),
+            "dominant_class": grp["dominant_class"].mode()[0],
+            "point_count":    int(grp["point_count"].sum()),
+            "mean_prob":      round(float(mean_prob_val), 3) if pd.notna(mean_prob_val) else None,
+            "n_industrial":   int(grp["n_industrial"].sum()),
+            "n_substation":   int(grp["n_substation"].sum()),
+            "n_solar":        int(grp["n_solar"].sum()),
+            "n_residential":  int(grp["n_residential"].sum()),
+            "geometry":       grp.geometry.union_all(),
+        }
+        if has_source:
+            row["source"] = grp["source"].mode()[0]
+        rows.append(row)
+    return gpd.GeoDataFrame(rows, crs=gdf.crs)
+
+
 def _hull(multipoint: MultiPoint, small_buf: float, fallback_buf: float):
     try:
         h = multipoint.concave_hull(ratio=HULL_RATIO, allow_holes=False)
@@ -947,6 +996,7 @@ def generate_cluster_polygons(pred_pts: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     valid["cluster_id"] = HDBSCAN(
         min_cluster_size=MIN_CLUSTER_SIZE,
         min_samples=MIN_SAMPLES_CLUSTER,
+        cluster_selection_method="leaf",
         metric="euclidean",
     ).fit_predict(coords)
 
@@ -969,7 +1019,10 @@ def generate_cluster_polygons(pred_pts: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
             "geometry":      _hull(MultiPoint(grp.geometry.tolist()),
                                    CLUSTER_FALLBACK_BUF, CLUSTER_HULL_FALLBACK),
         })
-    return gpd.GeoDataFrame(rows, crs=METRIC_CRS)
+    result = gpd.GeoDataFrame(rows, crs=METRIC_CRS)
+    result = _merge_nearby_cluster_polygons(result, CLUSTER_MERGE_DIST)
+    print(f"  {len(result)} clusters after merge (CLUSTER_MERGE_DIST={CLUSTER_MERGE_DIST} m)")
+    return result
 
 
 def generate_anti_cluster_polygons(pred_pts: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
@@ -1164,6 +1217,7 @@ def generate_minor_cluster_polygons(
         pd.concat(parts_to_concat, ignore_index=True),
         geometry="geometry", crs=METRIC_CRS,
     )
+    result = _merge_nearby_cluster_polygons(result, merge_dist=0)
     print(f"  total minor clusters: {len(result)}")
     return result
 
@@ -1267,16 +1321,9 @@ def main() -> None:
     project_dir = BASE_DIR / PROJECT
 
     print("\n" + "=" * 60)
-    print("PREDICTION CLUSTERS")
+    print("CLUSTER PIPELINE")
     print("=" * 60)
     for state in PREDICTION_STATES:
-        abbrev = _NAME_TO_ABBREV.get(state, state)
-        _process_state(abbrev, project_dir, force=FORCE)
-
-    print("\n" + "=" * 60)
-    print("TRAINING CLUSTERS")
-    print("=" * 60)
-    for state in TRAINING_STATES:
         abbrev = _NAME_TO_ABBREV.get(state, state)
         _process_state(abbrev, project_dir, force=FORCE)
 
