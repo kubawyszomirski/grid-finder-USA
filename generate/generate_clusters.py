@@ -51,7 +51,7 @@ from rasterio.transform import rowcol
 from scipy.ndimage import distance_transform_edt
 from scipy.spatial import cKDTree
 from shapely.geometry import Point, MultiPoint
-from sklearn.cluster import HDBSCAN
+from sklearn.cluster import HDBSCAN, KMeans
 from sklearn.metrics import accuracy_score, roc_auc_score, f1_score
 import xgboost as xgb
 
@@ -127,7 +127,7 @@ MIN_CLUSTER_SIZE          = 3
 MIN_CLUSTER_SIZE_ANTI     = 5
 MIN_SAMPLES_CLUSTER       = 5
 MIN_SAMPLES_ANTI          = 10
-CLUSTER_MERGE_DIST        = 60   # metres —merge leaf cluster polygons within this distance (0 = off)
+CLUSTER_MERGE_DIST        = 65   # metres —merge leaf cluster polygons within this distance (0 = off)
 HULL_RATIO            = 0.25
 CLUSTER_FALLBACK_BUF  = 150    # expand degenerate cluster hulls (small_buf)
 CLUSTER_HULL_FALLBACK = 600    # buffer for fully-failed concave hull (fallback_buf)
@@ -137,6 +137,7 @@ ARTIFICIAL_BUF_M      = 100    # buffer around point/polygon features for artifi
 
 # ---- Model training ----
 VALIDATION_SPLIT = 0.2   # fraction of training points held out for early stopping
+N_CV_FOLDS       = 5     # spatial folds for out-of-fold training-area prediction
 
 PROJECT = "project-ma"
 PREDICTION_STATES = ["MA"]
@@ -1134,6 +1135,16 @@ def generate_minor_cluster_polygons(
         minor_model = minor_model[keep].reset_index(drop=True)
         print(f"  {len(minor_model)} minor model clusters after removing major overlaps")
 
+    # ---- Step 2b: Remove minor clusters inside exclusion zones ----
+    excl_gdf = load_geo(paths.get("exclusions"), METRIC_CRS)
+    excl_union = excl_gdf.geometry.make_valid().unary_union \
+        if excl_gdf is not None and not excl_gdf.empty else None
+    if excl_union is not None and not minor_model.empty:
+        keep = ~minor_model.geometry.intersects(excl_union)
+        n_removed = (~keep).sum()
+        minor_model = minor_model[keep].reset_index(drop=True)
+        print(f"  {n_removed} minor model clusters removed (exclusion zones)  → {len(minor_model)} remaining")
+
     # Union of all HDBSCAN clusters (major + minor) — used to check artificial additions
     parts = []
     if not major_clusters.empty:
@@ -1161,6 +1172,8 @@ def generate_minor_cluster_polygons(
             poly = poly.buffer(ARTIFICIAL_BUF_M)   # small margin around the plant
             if pred_extent_union is not None and not poly.intersects(pred_extent_union):
                 continue
+            if excl_union is not None and poly.intersects(excl_union):
+                continue
             if hdbscan_union is not None and poly.intersects(hdbscan_union):
                 continue
             all_rows.append({
@@ -1187,6 +1200,8 @@ def generate_minor_cluster_polygons(
             poly = geom.centroid.buffer(ARTIFICIAL_BUF_M) \
                 if geom.geom_type != "Point" else geom.buffer(ARTIFICIAL_BUF_M)
             if pred_extent_union is not None and not poly.intersects(pred_extent_union):
+                continue
+            if excl_union is not None and poly.intersects(excl_union):
                 continue
             if hdbscan_union is not None and poly.intersects(hdbscan_union):
                 continue
@@ -1220,6 +1235,52 @@ def generate_minor_cluster_polygons(
     result = _merge_nearby_cluster_polygons(result, merge_dist=0)
     print(f"  total minor clusters: {len(result)}")
     return result
+
+
+# ==========================================
+#        TRAINING-AREA CV PREDICTION
+# ==========================================
+
+def train_predict_kfold(
+    train_pts:           gpd.GeoDataFrame,
+    train_area_pred_pts: gpd.GeoDataFrame,
+    n_folds:             int = N_CV_FOLDS,
+) -> gpd.GeoDataFrame:
+    """
+    Out-of-fold spatial cross-validation for the training area.
+
+    1. Fit k-means (n_folds clusters) on training point coordinates to
+       define n_folds contiguous spatial regions.
+    2. Assign each training-area prediction candidate to the nearest
+       k-means centroid (same spatial region).
+    3. For each fold k: train on training points NOT in region k,
+       predict on candidates IN region k.
+    4. Assemble and return all out-of-fold predictions.
+    """
+    print(f"\n[Phase 5T] Spatial {n_folds}-fold CV — training-area prediction...")
+
+    train_coords = np.c_[train_pts.geometry.x, train_pts.geometry.y]
+    km = KMeans(n_clusters=n_folds, random_state=42, n_init=10)
+    train_fold_ids = km.fit_predict(train_coords)
+
+    pred_coords = np.c_[train_area_pred_pts.geometry.x, train_area_pred_pts.geometry.y]
+    _, pred_fold_ids = cKDTree(km.cluster_centers_).query(pred_coords, k=1)
+
+    results = []
+    for fold in range(n_folds):
+        fold_train = train_pts[train_fold_ids != fold].copy()
+        fold_pred  = train_area_pred_pts[pred_fold_ids == fold].copy()
+        print(f"\n  -- Fold {fold + 1}/{n_folds}  "
+              f"(train={len(fold_train):,}  predict={len(fold_pred):,}) --")
+        if fold_train.empty or fold_pred.empty:
+            continue
+        results.append(train_and_predict(fold_train, fold_pred))
+
+    if not results:
+        return gpd.GeoDataFrame(columns=["geometry", "grid_prob"], crs=METRIC_CRS)
+    return gpd.GeoDataFrame(
+        pd.concat(results, ignore_index=True), geometry="geometry", crs=METRIC_CRS,
+    )
 
 
 # ==========================================
@@ -1311,6 +1372,51 @@ def _process_state(abbrev: str, project_dir: Path, force: bool = False) -> None:
     minor = generate_minor_cluster_polygons(pred_pts, clusters, paths)
     minor.to_crs(FINAL_CRS).to_file(p_clusters_minor, driver="GPKG")
     print(f"  saved → {p_clusters_minor.name}  ({len(minor)} minor clusters)")
+
+    # ---- Training-area cluster pipeline (out-of-fold spatial CV) ----
+    training_abbrevs = [_NAME_TO_ABBREV.get(s, s) for s in TRAINING_STATES]
+    if abbrev in training_abbrevs:
+        print(f"\n{'='*60}")
+        print(f" Training-area cluster pipeline — {STATE_FULL_NAMES[abbrev]} ({abbrev})")
+        print(f"{'='*60}")
+
+        p_train_pred_feats     = out / f"{abbrev}_training_pred_features.gpkg"
+        p_train_clusters       = out / f"{abbrev}_training_cluster_polygons.gpkg"
+        p_train_clusters_minor = out / f"{abbrev}_training_cluster_polygons_minor.gpkg"
+        p_train_anti           = out / f"{abbrev}_training_anti_cluster_polygons.gpkg"
+
+        # Build paths for training area: prediction extent = training range
+        train_range_gdf = load_geo(paths["training_range"], METRIC_CRS)
+        paths_train = {**paths, "prediction_extent": train_range_gdf}
+
+        # Phases 3T + 4T: prediction candidates + features clipped to training area
+        if not force and p_train_pred_feats.exists():
+            print(f"\n[cached] {p_train_pred_feats.name} — loading (--force to rerun)")
+            train_area_pred_pts = gpd.read_file(p_train_pred_feats).to_crs(METRIC_CRS)
+        else:
+            train_area_pred_pts = generate_prediction_candidates(paths_train)
+            print("\n[Phase 4T] Assigning features to training-area prediction candidates...")
+            train_area_pred_pts = assign_features(train_area_pred_pts, paths_train)
+            train_area_pred_pts.to_crs(FINAL_CRS).to_file(p_train_pred_feats, driver="GPKG")
+            print(f"  saved → {p_train_pred_feats.name}")
+
+        # Phase 5T: spatial k-fold CV — predict on training area without data leakage
+        train_area_pred_pts = train_predict_kfold(train_pts, train_area_pred_pts)
+
+        # Phase 6T: cluster polygons
+        train_clusters = generate_cluster_polygons(train_area_pred_pts)
+        train_clusters.to_crs(FINAL_CRS).to_file(p_train_clusters, driver="GPKG")
+        print(f"  saved → {p_train_clusters.name}  ({len(train_clusters)} clusters)")
+
+        # Phase 7T: anti-cluster polygons
+        train_anti = generate_anti_cluster_polygons(train_area_pred_pts)
+        train_anti.to_crs(FINAL_CRS).to_file(p_train_anti, driver="GPKG")
+        print(f"  saved → {p_train_anti.name}  ({len(train_anti)} anti-clusters)")
+
+        # Phase 8T: minor cluster polygons
+        train_minor = generate_minor_cluster_polygons(train_area_pred_pts, train_clusters, paths_train)
+        train_minor.to_crs(FINAL_CRS).to_file(p_train_clusters_minor, driver="GPKG")
+        print(f"  saved → {p_train_clusters_minor.name}  ({len(train_minor)} minor clusters)")
 
     print(f"\n{'='*60}")
     print(f" DONE — {STATE_FULL_NAMES[abbrev]} ({abbrev})")

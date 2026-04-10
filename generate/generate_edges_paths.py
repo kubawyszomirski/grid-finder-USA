@@ -44,6 +44,7 @@ from pathlib import Path
 
 import geopandas as gpd
 import networkx as nx
+import shapely
 import numpy as np
 import pandas as pd
 import pyproj
@@ -72,16 +73,14 @@ EXCLUDE_GRID_FROM_PREDICTION = False  # subtract 3-phase grid range from predict
 
 # ---- Pathfinding ----
 N_NEAREST_SUBS_P1     = 2
-N_NEAREST_CLUSTERS_P1 = 15
+N_NEAREST_CLUSTERS_P1 = 25
 N_NEAREST_SUBS_P2     = 2
-N_NEAREST_CLUSTERS_P2 = 10
+N_NEAREST_CLUSTERS_P2 = 15
+N_NEAREST_MAJOR_P3    = 2   # pass 3: minor cluster → nearest N major clusters
 
 # ---- Node snapping ----
 SNAP_TOL_M         = 1.0   # metres — endpoint tolerance for topology inference
 K_NODES_PER_CLUSTER = 3    # network nodes sampled per cluster polygon
-
-# ---- In-cluster flag ----
-CLUSTER_OVERLAP_MIN = 0.50  # fraction of edge length inside cluster → in_cluster = 1
 
 # ---- Edge feature computation ----
 _EDGE_BUF_M      = 250   # buffer radius for building / land cover / raster features
@@ -119,6 +118,7 @@ def get_state_paths(s: str) -> dict:
     t   = raw / "TRANSPORT"
     return {
         "edges_raw":   t / f"{s}_edges_raw.gpkg",
+        "edges_clean": t / f"{s}_edges_clean.gpkg",
         # ---- Generators ----
         "solar":                      _find(raw / "GENERATORS",  f"{s}_solar_merged"),
         "wind":                       _find(raw / "GENERATORS",  f"{s}_wind_merged"),
@@ -163,13 +163,14 @@ def get_state_paths(s: str) -> dict:
     }
 
 
-def get_project_paths(s: str, project_dir: Path) -> dict:
+def get_project_paths(s: str, project_dir: Path, is_training: bool = False) -> dict:
     """Cluster outputs are project-specific (depend on prediction_extent)."""
     clu = project_dir / "clusters"
+    prefix = f"{s}_training" if is_training else s
     return {
-        "clusters":       clu / f"{s}_cluster_polygons.gpkg",
-        "clusters_minor": clu / f"{s}_cluster_polygons_minor.gpkg",
-        "anti_clusters":  clu / f"{s}_anti_cluster_polygons.gpkg",
+        "clusters":       clu / f"{prefix}_cluster_polygons.gpkg",
+        "clusters_minor": clu / f"{prefix}_cluster_polygons_minor.gpkg",
+        "anti_clusters":  clu / f"{prefix}_anti_cluster_polygons.gpkg",
     }
 
 
@@ -197,17 +198,44 @@ def _entropy_and_mode(terminals: set[int], class_map: dict) -> tuple[float, str 
 #        EDGE FEATURE COMPUTATION
 # ==========================================
 
+def _cluster_overlap_fracs(edges_gdf: gpd.GeoDataFrame,
+                            clusters_gdf: gpd.GeoDataFrame | None) -> np.ndarray:
+    """Fraction of each edge's length that overlaps cluster polygons.
+    Uses STRtree so we only call intersection against the small set of
+    nearby clusters per edge, not a pre-built union of all clusters."""
+    result = np.zeros(len(edges_gdf), dtype=np.float32)
+    if clusters_gdf is None or clusters_gdf.empty:
+        return result
+    sindex  = clusters_gdf.sindex
+    geoms   = edges_gdf.geometry.values
+    lengths = edges_gdf.geometry.length.values
+    for i, geom in enumerate(geoms):
+        if geom is None or geom.is_empty or lengths[i] < 1e-9:
+            continue
+        cands = list(sindex.query(geom, predicate="intersects"))
+        if not cands:
+            continue
+        local_union = shapely.union_all(clusters_gdf.geometry.iloc[cands].values)
+        overlap = geom.intersection(local_union).length
+        result[i] = round(overlap / lengths[i], 4)
+    return result
+
+
 def _snap_to_points(data: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """Replace polygon / line geometries with centroids for distance queries."""
+    """Replace polygon geometries with centroids for distance queries.
+    Line geometries are kept as-is so sjoin_nearest measures true nearest-point-on-line
+    distance (important for transmission lines / railways that may cross an edge)."""
     data = data[["geometry"]].copy().reset_index(drop=True)
-    non_point = ~data.geometry.geom_type.isin(["Point", "MultiPoint"])
-    if non_point.any():
-        data.loc[non_point, "geometry"] = data.loc[non_point, "geometry"].centroid
+    is_poly = data.geometry.geom_type.isin(["Polygon", "MultiPolygon"])
+    if is_poly.any():
+        data.loc[is_poly, "geometry"] = data.loc[is_poly, "geometry"].centroid
     return data
 
 
 def _line_curvature(line) -> float:
     """Total turning angle (radians) per metre of line length."""
+    if line.geom_type == "MultiLineString":
+        line = max(line.geoms, key=lambda g: g.length)
     coords = np.array(line.coords)
     if len(coords) < 3:
         return 0.0
@@ -426,40 +454,43 @@ def compute_edge_features(edges: gpd.GeoDataFrame, paths: dict) -> gpd.GeoDataFr
     # Parcel values (20 m buffer, area-weighted mean)
     # ------------------------------------------------------------------
     print("  [feat] parcel values")
-    out_cols = [f"parcel_{c}" for c in _PARCEL_COLS]
-    for c in out_cols:
+    for c in [f"parcel_{c}" for c in _PARCEL_COLS]:
         edges[c] = np.nan
     parcels = load_geo(paths.get("parcels"), METRIC_CRS)
     if parcels is not None and not parcels.empty:
         value_cols = [c for c in _PARCEL_COLS if c in parcels.columns]
         for c in value_cols:
             parcels[c] = pd.to_numeric(parcels[c], errors="coerce")
-        sindex  = parcels.sindex
-        buffers = edges.geometry.buffer(_PARCEL_BUF_M)
-        results = {c: [] for c in value_cols}
-        for buf in buffers:
-            cands = list(sindex.query(buf, predicate="intersects"))
-            if not cands:
-                for c in value_cols:
-                    results[c].append(np.nan)
-                continue
-            local = parcels.iloc[cands].copy()
-            local["_w"] = local.geometry.intersection(buf).area
-            total_w = local["_w"].sum()
-            if total_w <= 0:
-                for c in value_cols:
-                    results[c].append(np.nan)
-                continue
+
+        # Pre-compute all buffer geometries as a shapely array
+        buf_arr = edges.geometry.buffer(_PARCEL_BUF_M).values
+
+        # Restrict parcels to the clipped extent (avoid querying entire state file)
+        extent_geom = shapely.union_all(buf_arr).envelope
+        parc_local = parcels[
+            parcels.geometry.intersects(extent_geom)
+        ][["geometry"] + value_cols].reset_index(drop=True).copy()
+
+        if not parc_local.empty:
+            # All (edge, parcel) pairs at once — no Python loop
+            tree = STRtree(parc_local.geometry.values)
+            edge_idxs, parc_idxs = tree.query(buf_arr, predicate="intersects")
+
+            # Vectorized intersection areas
+            weights = shapely.area(shapely.intersection(
+                buf_arr[edge_idxs], parc_local.geometry.values[parc_idxs]
+            ))
+
+            n = len(edges)
             for c in value_cols:
-                valid = local[c].notna()
-                if not valid.any():
-                    results[c].append(0.0)
-                else:
-                    w = local.loc[valid, "_w"]
-                    v = local.loc[valid, c]
-                    results[c].append(float((v * w).sum() / w.sum()))
-        for c in value_cols:
-            edges[f"parcel_{c}"] = results[c]
+                vals = parc_local[c].values[parc_idxs].astype(float)
+                valid = ~np.isnan(vals)
+                w = np.where(valid, weights, 0.0)
+                v = np.where(valid, vals * weights, 0.0)
+                w_sum = np.bincount(edge_idxs, weights=w, minlength=n).astype(float)
+                v_sum = np.bincount(edge_idxs, weights=v, minlength=n).astype(float)
+                result = np.where(w_sum > 0, v_sum / w_sum, np.nan)
+                edges[f"parcel_{c}"] = result
 
     # ------------------------------------------------------------------
     # DSO boundary crossings
@@ -471,9 +502,14 @@ def compute_edge_features(edges: gpd.GeoDataFrame, paths: dict) -> gpd.GeoDataFr
         dso = dso[["geometry"]].reset_index(drop=True).copy()
         dso["_dso_id"] = dso.index.astype(float)
 
+        def _endpoint(g, first: bool):
+            if g.geom_type == "MultiLineString":
+                g = max(g.geoms, key=lambda x: x.length)
+            return Point(g.coords[0] if first else g.coords[-1])
+
         # One GeoDataFrame of all unique edge endpoints (starts then ends)
-        starts = [Point(g.coords[0])  for g in edges.geometry]
-        ends   = [Point(g.coords[-1]) for g in edges.geometry]
+        starts = [_endpoint(g, True)  for g in edges.geometry]
+        ends   = [_endpoint(g, False) for g in edges.geometry]
         n      = len(edges)
         pts_gdf = gpd.GeoDataFrame(
             geometry=starts + ends, crs=METRIC_CRS,
@@ -858,7 +894,7 @@ def compute_grid(edges: gpd.GeoDataFrame, paths: dict) -> gpd.GeoDataFrame:
 
 
 def _process_state(abbrev: str, project_dir: Path, is_training: bool = False) -> None:
-    paths = {**get_state_paths(abbrev), **get_project_paths(abbrev, project_dir)}
+    paths = {**get_state_paths(abbrev), **get_project_paths(abbrev, project_dir, is_training)}
 
     suffix = "training" if is_training else "prediction"
     extent_file = "training_extent.gpkg" if is_training else "prediction_extent.gpkg"
@@ -882,6 +918,7 @@ def _process_state(abbrev: str, project_dir: Path, is_training: bool = False) ->
     # 1b. Clip to extent
     # ------------------------------------------------------------------
     extent_path = project_dir / extent_file
+    extent_union = None
     if extent_path.exists():
         print(f"\n[1b] Clipping to {extent_file}...")
         extent = gpd.read_file(extent_path).to_crs(METRIC_CRS)
@@ -924,12 +961,10 @@ def _process_state(abbrev: str, project_dir: Path, is_training: bool = False) ->
     n_minor = len(minor) if minor is not None else 0
     print(f"  {len(major)} major + {n_minor} minor clusters")
 
-    # Union of all clusters for in_cluster computation
     all_clusters = pd.concat(
         [df for df in [major, minor] if df is not None and not df.empty],
         ignore_index=True,
     )
-    cluster_union = all_clusters.geometry.union_all()
 
     # Cluster class map for entropy
     id_col    = next((c for c in ("cluster_id", "id") if c in major.columns), None)
@@ -944,7 +979,11 @@ def _process_state(abbrev: str, project_dir: Path, is_training: bool = False) ->
     # ------------------------------------------------------------------
     print("\n[4] Mapping cluster polygons to network nodes...")
     cluster_node_map = build_cluster_node_map(major, node_ids, node_xy, G)
-    print(f"  {len(cluster_node_map)} clusters mapped")
+    print(f"  {len(cluster_node_map)} major clusters mapped")
+    minor_cluster_node_map: dict[int, list[int]] = {}
+    if minor is not None and not minor.empty:
+        minor_cluster_node_map = build_cluster_node_map(minor, node_ids, node_xy, G)
+        print(f"  {len(minor_cluster_node_map)} minor clusters mapped")
 
     # ------------------------------------------------------------------
     # 5. Snap substations → network nodes
@@ -998,35 +1037,58 @@ def _process_state(abbrev: str, project_dir: Path, is_training: bool = False) ->
     print(f"  {n_used_p2:,} edges used")
 
     # ------------------------------------------------------------------
+    # 8b. Pathfinding Pass 3 — minor clusters → nearest major clusters
+    # ------------------------------------------------------------------
+    print("\n[8b] Pathfinding — Pass 3 (minor → major clusters)...")
+    usage_p3: dict[tuple[int, int], dict] = {}
+    if minor_cluster_node_map:
+        major_nodes_set = {nodes[0] for nodes in cluster_node_map.values() if nodes}
+        usage_p3 = run_pathfinding_pass(
+            G2, minor_cluster_node_map, major_nodes_set, class_map,
+            N_NEAREST_MAJOR_P3, 0, all_edge_pairs,
+        )
+        n_used_p3 = sum(1 for u in usage_p3.values() if u["sub_path_count"] > 0)
+        print(f"  {n_used_p3:,} edges used")
+    else:
+        print("  No minor clusters — skipping")
+
+    # ------------------------------------------------------------------
     # 9. Assign stats + in_cluster to edges
     # ------------------------------------------------------------------
     print("\n[9] Assigning path stats to edges...")
 
     n = len(edges)
     new_cols: dict[str, list] = {
-        "p1_sub_path_count":   [0] * n,
-        "p1_tt_path_count":    [0] * n,
-        "p1_unique_terminals": [0] * n,
-        "p1_usage_entropy":    [0.0] * n,
-        "p1_usage_mode":       [None] * n,
-        "p2_sub_path_count":   [0] * n,
-        "p2_tt_path_count":    [0] * n,
-        "p2_unique_terminals": [0] * n,
-        "p2_usage_entropy":    [0.0] * n,
-        "p2_usage_mode":       [None] * n,
-        "is_used_by_any_path": [0] * n,
-        "in_cluster":          [0] * n,
+        "p1_sub_path_count":        [0] * n,
+        "p1_tt_path_count":         [0] * n,
+        "p1_unique_terminals":      [0] * n,
+        "p1_usage_entropy":         [0.0] * n,
+        "p1_usage_mode":            [None] * n,
+        "p2_sub_path_count":        [0] * n,
+        "p2_tt_path_count":         [0] * n,
+        "p2_unique_terminals":      [0] * n,
+        "p2_usage_entropy":         [0.0] * n,
+        "p2_usage_mode":            [None] * n,
+        "p3_minor_to_major_count":  [0] * n,
+        "is_used_by_any_path":      [0] * n,
+        "cluster_overlap_frac":     [0.0] * n,
     }
 
-    for i, (row_idx, row) in enumerate(edges.iterrows()):
-        u = row_to_u.get(row_idx)
-        v = row_to_v.get(row_idx)
-        if u is None or v is None:
-            continue
-        e = (min(u, v), max(u, v))
+    # Pre-build edge key list — avoids iterrows overhead on large edge sets
+    idx_list  = edges.index.tolist()
+    u_list    = [row_to_u.get(i) for i in idx_list]
+    v_list    = [row_to_v.get(i) for i in idx_list]
+    edge_keys = [
+        (min(u, v), max(u, v)) if (u is not None and v is not None) else None
+        for u, v in zip(u_list, v_list)
+    ]
 
+    for i, e in enumerate(edge_keys):
+        if e is None:
+            continue
         s1 = usage_p1.get(e)
         s2 = usage_p2.get(e)
+        s3 = usage_p3.get(e)
 
         if s1 is not None:
             ent1, mode1 = _entropy_and_mode(s1["terminals"], class_map)
@@ -1044,25 +1106,66 @@ def _process_state(abbrev: str, project_dir: Path, is_training: bool = False) ->
             new_cols["p2_usage_entropy"][i]    = float(ent2)
             new_cols["p2_usage_mode"][i]       = mode2
 
-        if s1 is not None and s2 is not None:
-            total = (s1["sub_path_count"] + s1["tt_path_count"]
-                     + s2["sub_path_count"] + s2["tt_path_count"])
-            new_cols["is_used_by_any_path"][i] = int(total > 0)
+        if s3 is not None:
+            new_cols["p3_minor_to_major_count"][i] = int(s3["sub_path_count"])
 
-        # in_cluster: ≥ CLUSTER_OVERLAP_MIN of edge length inside cluster union
-        geom = row.geometry
-        if geom is not None and not geom.is_empty and cluster_union is not None:
-            try:
-                overlap = geom.intersection(cluster_union).length
-                new_cols["in_cluster"][i] = int(
-                    overlap / max(geom.length, 1e-9) >= CLUSTER_OVERLAP_MIN
-                )
-            except Exception:
-                pass
+        total = (
+            (s1["sub_path_count"] + s1["tt_path_count"] if s1 else 0)
+            + (s2["sub_path_count"] + s2["tt_path_count"] if s2 else 0)
+            + (s3["sub_path_count"] if s3 else 0)
+        )
+        new_cols["is_used_by_any_path"][i] = int(total > 0)
 
-    edges_out = edges.copy()
+    # cluster_overlap_frac — vectorised via STRtree (avoids intersecting the
+    # full cluster union for every edge; only unions the few nearby clusters)
+    print("  computing cluster_overlap_frac...")
+    new_cols["cluster_overlap_frac"] = _cluster_overlap_fracs(edges, all_clusters).tolist()
+
+    # Attach stats to raw edges (used only for the transfer below)
+    edges_raw_stats = edges.copy()
     for col, vals in new_cols.items():
-        edges_out[col] = vals
+        edges_raw_stats[col] = vals
+
+    # ------------------------------------------------------------------
+    # 9b. Load edges_clean and transfer path stats from raw
+    # ------------------------------------------------------------------
+    print("\n[9b] Loading edges_clean and transferring path stats...")
+    stat_cols = list(new_cols.keys())
+
+    clean_path = paths.get("edges_clean")
+    if clean_path and Path(clean_path).exists():
+        edges_clean = gpd.read_file(clean_path).to_crs(METRIC_CRS)
+        if extent_union is not None:
+            edges_clean = edges_clean[edges_clean.geometry.intersects(extent_union)].copy()
+            edges_clean = gpd.clip(edges_clean, extent_union).reset_index(drop=True)
+        print(f"  {len(edges_clean):,} clean edges after clipping")
+
+        # Transfer: match each clean edge centroid to nearest raw edge centroid
+        raw_centroids = gpd.GeoDataFrame(
+            edges_raw_stats[stat_cols],
+            geometry=edges_raw_stats.geometry.centroid,
+            crs=METRIC_CRS,
+        ).reset_index(drop=True)
+        clean_centroids = gpd.GeoDataFrame(
+            geometry=edges_clean.geometry.centroid, crs=METRIC_CRS,
+        )
+        # Drop cluster_overlap_frac — will recompute on clean geometry
+        transfer_cols = [c for c in stat_cols if c != "cluster_overlap_frac"]
+        joined = gpd.sjoin_nearest(
+            clean_centroids, raw_centroids[transfer_cols + ["geometry"]],
+            how="left", distance_col="_snap_dist",
+        )
+        joined = joined[~joined.index.duplicated(keep="first")]
+        for col in transfer_cols:
+            edges_clean[col] = joined[col].reindex(edges_clean.index).values
+
+        # Recompute cluster_overlap_frac on clean geometry
+        edges_clean["cluster_overlap_frac"] = _cluster_overlap_fracs(edges_clean, all_clusters)
+
+        edges_out = edges_clean
+    else:
+        print("  [warn] edges_clean not found — falling back to raw edges")
+        edges_out = edges_raw_stats
 
     # ------------------------------------------------------------------
     # 10. Assign road-style features
@@ -1079,17 +1182,17 @@ def _process_state(abbrev: str, project_dir: Path, is_training: bool = False) ->
     # ------------------------------------------------------------------
     # 11. Save
     # ------------------------------------------------------------------
-    print("\n[11] Saving edges_clean...")
+    print("\n[11] Saving edges output...")
     out_dir = project_dir / "edges"
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"{abbrev}_edges_{suffix}.gpkg"
     edges_out.to_crs(FINAL_CRS).to_file(out, driver="GPKG")
 
-    used_any   = sum(new_cols["is_used_by_any_path"])
-    in_cluster = sum(new_cols["in_cluster"])
+    used_any = int(edges_out["is_used_by_any_path"].sum()) if "is_used_by_any_path" in edges_out.columns else 0
+    in_cluster = int((edges_out["cluster_overlap_frac"] >= 0.5).sum()) if "cluster_overlap_frac" in edges_out.columns else 0
     print(f"  {len(edges_out):,} edges  →  {out.name}")
     print(f"  {used_any:,} used by at least one path")
-    print(f"  {in_cluster:,} lie within a cluster (≥{int(CLUSTER_OVERLAP_MIN*100)}% overlap)")
+    print(f"  {in_cluster:,} lie ≥50% within a cluster")
 
     print(f"\n{'='*60}")
     print(f" DONE — {STATE_FULL_NAMES[abbrev]} ({abbrev})")

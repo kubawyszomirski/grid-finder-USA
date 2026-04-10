@@ -53,7 +53,7 @@ warnings.filterwarnings("ignore")
 #            CONFIGURATION
 # ==========================================
 
-BASE_DIR   = Path("..")
+BASE_DIR   = Path(__file__).parent.parent
 METRIC_CRS = "EPSG:5070"
 FINAL_CRS  = "EPSG:4326"
 LABEL_COL  = "grid"

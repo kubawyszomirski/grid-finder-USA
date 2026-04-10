@@ -48,6 +48,7 @@ FINAL_CRS          = "EPSG:4326"
 
 OVERLAP_BUFFER     = 12      # m  — grid/road proximity for overlap detection
 OVERLAP_THRESHOLD  = 0.80    # 80 % grid-line overlap → treat as road, drop grid line
+ROAD_TAG_THRESHOLD = 0.60    # min fraction of road length overlapping grid buffer → tag as is_grid
 MAX_EXTEND_DIST    = 300     # m  — max endpoint snap for isolated grid lines
 MAX_STITCH_LEN     = 3500    # m  — maximum merged segment length
 SPLIT_THRESHOLD    = 5000    # m  — split roads longer than this
@@ -207,7 +208,9 @@ def integrate_osm_grid(roads: gpd.GeoDataFrame, grid_path: Path) -> gpd.GeoDataF
         road_buf_union = nearby.geometry.buffer(OVERLAP_BUFFER).unary_union
         if line.intersection(road_buf_union).length / line.length >= OVERLAP_THRESHOLD:
             for ridx in nearby.index:
-                if roads.at[ridx, "geometry"].distance(line) <= OVERLAP_BUFFER:
+                road_geom = roads.at[ridx, "geometry"]
+                overlap_len = road_geom.intersection(line.buffer(OVERLAP_BUFFER)).length
+                if overlap_len / max(road_geom.length, 1e-9) >= ROAD_TAG_THRESHOLD:
                     roads.at[ridx, "is_grid"] = "yes"
             drop_idx.append(idx)
 

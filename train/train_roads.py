@@ -1,30 +1,35 @@
 #!/usr/bin/env python3
 """
 train_roads.py
-Train an XGBoost binary classifier on preprocessed road features.
+Train an XGBoost binary classifier on preprocessed road features
+using spatial K-fold cross-validation.
+
+Spatial folds: roads are divided into N latitude strips using quantile
+bins on centroid_lat (from meta_all).  Each fold's validation set is one
+contiguous geographic strip; training uses the remaining K-1 strips.
+This avoids leakage between spatially autocorrelated neighbouring roads.
 
 Reads from {project}/roads/preprocessed/:
-    X_train.parquet, y_train.parquet
-    X_val.parquet,   y_val.parquet
-    feature_config.json
+    X_all.parquet, y_all.parquet, meta_all.parquet, feature_config.json
 
 Writes to {project}/models_roads/:
-    roads_model_{N}.ubj          — XGBoost model (binary format)
-    roads_model_{N}_meta.json    — training config, val metrics, feature importances
-    roads_model_{N}_val_preds.parquet — val set road_id + y_true + y_proba
-
-Models are auto-numbered starting at 0 (next available index).
+    roads_model_{N}.ubj                  — full model (all training data)
+    roads_model_{N}_meta.json            — training config, OOF metrics, importances
+    roads_model_{N}_oof_preds.parquet    — road_id + fold + y_true + y_proba (OOF)
+    roads_model_{N}_fold_{k}.ubj         — per-fold models
 
 Usage:
     python train_roads.py --project project-ma
-    python train_roads.py --project project-ma --n-estimators 3000 --max-depth 6
+    python train_roads.py --project project-ma --n-folds 5 --max-depth 6
 """
 from __future__ import annotations
 
 import argparse
 import json
+import sys
 import warnings
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
 import pandas as pd
@@ -42,22 +47,22 @@ warnings.filterwarnings("ignore")
 
 PROJECT      = "project-ma"
 RANDOM_STATE = 42
+N_FOLDS      = 8
 
-# XGBoost defaults — all overridable via CLI
 XGB_DEFAULTS = dict(
-    n_estimators        = 5000,
-    learning_rate       = 0.03,
-    max_depth           = 5,
-    min_child_weight    = 5,
-    subsample           = 0.8,
-    colsample_bytree    = 0.8,
-    reg_lambda          = 2.0,
-    gamma               = 0.1,
-    objective           = "binary:logistic",
-    eval_metric         = "aucpr",
-    tree_method         = "hist",
-    early_stopping_rounds = 200,
-    n_jobs              = -1,
+    n_estimators          = 6000,
+    learning_rate         = 0.03,
+    max_depth             = 5,
+    min_child_weight      = 5,
+    subsample             = 0.8,
+    colsample_bytree      = 0.8,
+    reg_lambda            = 2.0,
+    gamma                 = 0.1,
+    objective             = "binary:logistic",
+    eval_metric           = "aucpr",
+    tree_method           = "hist",
+    early_stopping_rounds = 300,
+    n_jobs                = -1,
 )
 
 
@@ -87,21 +92,44 @@ def _load_parquet(path: Path, label: str) -> pd.DataFrame | None:
     return df
 
 
+def assign_spatial_folds(meta: pd.DataFrame, n_folds: int) -> np.ndarray:
+    """
+    Assign each road segment to a spatial fold index in [0, n_folds).
+
+    Strategy: quantile-bin centroid_lat into n_folds equal-population strips.
+    Fold k's validation set = roads whose centroid falls in the k-th lat band.
+    Quantile binning ensures roughly balanced fold sizes even when road density
+    varies by latitude (e.g. denser near cities).
+
+    Requires meta to have a 'centroid_lat' column, written by preprocess_roads.py.
+    """
+    if "centroid_lat" not in meta.columns:
+        raise ValueError(
+            "meta_all must contain 'centroid_lat' for spatial fold assignment.\n"
+            "  → Re-run preprocess_roads.py to regenerate meta_all.parquet."
+        )
+    lat = meta["centroid_lat"].values
+    bins = np.quantile(lat, np.linspace(0, 1, n_folds + 1))
+    bins[0]  -= 1e-9   # include min value
+    bins[-1] += 1e-9   # include max value
+    return np.clip(np.digitize(lat, bins) - 1, 0, n_folds - 1)
+
+
 # ==========================================
 #                  MAIN
 # ==========================================
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train XGBoost on preprocessed road features.",
+        description="Train XGBoost on road features using spatial K-fold CV.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
             "  python train_roads.py --project project-ma\n"
-            "  python train_roads.py --project project-ma --n-estimators 3000 --max-depth 6\n"
+            "  python train_roads.py --project project-ma --n-folds 5 --max-depth 6\n"
         ),
     )
-    parser.add_argument("--project", default=PROJECT,
+    parser.add_argument("--project",          default=PROJECT,
                         help="Project folder name (default: %(default)s)")
     parser.add_argument("--n-estimators",     type=int,   default=XGB_DEFAULTS["n_estimators"])
     parser.add_argument("--learning-rate",    type=float, default=XGB_DEFAULTS["learning_rate"])
@@ -111,6 +139,8 @@ def main() -> None:
     parser.add_argument("--colsample-bytree", type=float, default=XGB_DEFAULTS["colsample_bytree"])
     parser.add_argument("--reg-lambda",       type=float, default=XGB_DEFAULTS["reg_lambda"])
     parser.add_argument("--gamma",            type=float, default=XGB_DEFAULTS["gamma"])
+    parser.add_argument("--n-folds",          type=int,   default=N_FOLDS,
+                        help="Number of spatial CV folds (default: %(default)s)")
     args = parser.parse_args()
 
     project_dir = BASE_DIR / args.project
@@ -129,127 +159,179 @@ def main() -> None:
     print(f" Train Roads — {args.project}  →  {model_stem}")
     print(f"{'='*60}")
 
-    # ---- Load preprocessed splits ----
+    # ---- Load data ----
     print(f"\nLoading from {prep_dir} …")
-    X_train = _load_parquet(prep_dir / "X_train.parquet",    "train features")
-    y_train = _load_parquet(prep_dir / "y_train.parquet",    "train labels")
-    X_val   = _load_parquet(prep_dir / "X_val.parquet",      "val features")
-    y_val   = _load_parquet(prep_dir / "y_val.parquet",      "val labels")
+    X_all_df = _load_parquet(prep_dir / "X_all.parquet",    "all features")
+    y_all_df = _load_parquet(prep_dir / "y_all.parquet",    "all labels")
+    meta_all = _load_parquet(prep_dir / "meta_all.parquet", "all meta")
 
-    if any(x is None for x in [X_train, y_train, X_val, y_val]):
-        print("[ERROR] Missing preprocessed splits — run preprocess-roads.py first.")
+    if any(x is None for x in [X_all_df, y_all_df, meta_all]):
+        print("[ERROR] Missing preprocessed files — run preprocess_roads.py first.")
         return
 
-    # Squeeze label DataFrames to Series
-    y_train_s = y_train.iloc[:, 0].astype(int)
-    y_val_s   = y_val.iloc[:, 0].astype(int)
+    X_all   = X_all_df
+    y_all_s = y_all_df.iloc[:, 0].astype(int)
 
-    # Load meta for val road_ids (optional — for output parquet)
-    meta_val = _load_parquet(prep_dir / "meta_val.parquet", "val meta")
-
-    # Load feature config for provenance
     cfg_path = prep_dir / "feature_config.json"
     feature_config: dict = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
 
     # ---- Class balance ----
-    n_pos = int((y_train_s == 1).sum())
-    n_neg = int((y_train_s == 0).sum())
+    n_pos = int((y_all_s == 1).sum())
+    n_neg = int((y_all_s == 0).sum())
     scale_pos_weight = round(n_neg / max(n_pos, 1), 4)
-    print(f"\n  Train positives: {n_pos:,}  negatives: {n_neg:,}  scale_pos_weight: {scale_pos_weight}")
-    print(f"  Val   positives: {int((y_val_s==1).sum()):,}  negatives: {int((y_val_s==0).sum()):,}")
+    print(f"\n  Positives: {n_pos:,}  negatives: {n_neg:,}  scale_pos_weight: {scale_pos_weight}")
 
-    # ---- Build model ----
+    # ---- Assign spatial folds ----
+    fold_ids = assign_spatial_folds(meta_all, args.n_folds)
+    unique, counts = np.unique(fold_ids, return_counts=True)
+    print(f"\n  Spatial folds ({args.n_folds} lat strips):")
+    for fid, cnt in zip(unique, counts):
+        mask = fold_ids == fid
+        lat_lo = float(meta_all["centroid_lat"].values[mask].min())
+        lat_hi = float(meta_all["centroid_lat"].values[mask].max())
+        n_pos_f = int((y_all_s.values[mask] == 1).sum())
+        print(f"    fold {fid}: {cnt:>6,} roads  lat [{lat_lo:.3f}, {lat_hi:.3f}]  pos={n_pos_f:,}")
+
+    # ---- Shared XGBoost params ----
     params = dict(
-        n_estimators        = args.n_estimators,
-        learning_rate       = args.learning_rate,
-        max_depth           = args.max_depth,
-        min_child_weight    = args.min_child_weight,
-        subsample           = args.subsample,
-        colsample_bytree    = args.colsample_bytree,
-        reg_lambda          = args.reg_lambda,
-        gamma               = args.gamma,
-        objective           = XGB_DEFAULTS["objective"],
-        eval_metric         = XGB_DEFAULTS["eval_metric"],
-        tree_method         = XGB_DEFAULTS["tree_method"],
+        n_estimators          = args.n_estimators,
+        learning_rate         = args.learning_rate,
+        max_depth             = args.max_depth,
+        min_child_weight      = args.min_child_weight,
+        subsample             = args.subsample,
+        colsample_bytree      = args.colsample_bytree,
+        reg_lambda            = args.reg_lambda,
+        gamma                 = args.gamma,
+        objective             = XGB_DEFAULTS["objective"],
+        eval_metric           = XGB_DEFAULTS["eval_metric"],
+        tree_method           = XGB_DEFAULTS["tree_method"],
         early_stopping_rounds = XGB_DEFAULTS["early_stopping_rounds"],
-        n_jobs              = XGB_DEFAULTS["n_jobs"],
-        scale_pos_weight    = scale_pos_weight,
-        random_state        = RANDOM_STATE,
+        n_jobs                = XGB_DEFAULTS["n_jobs"],
+        scale_pos_weight      = scale_pos_weight,
+        random_state          = RANDOM_STATE,
     )
 
-    model = XGBClassifier(**params)
+    # ==================================================================
+    # SPATIAL K-FOLD — train on K-1 lat strips, validate on 1 lat strip
+    # ==================================================================
+    print(f"\n{'─'*60}")
+    print(f" Spatial K-Fold ({args.n_folds} folds) — OOF predictions")
+    print(f"{'─'*60}")
 
-    print(f"\nTraining XGBoost (max {args.n_estimators} trees, early stop {XGB_DEFAULTS['early_stopping_rounds']}) …")
-    model.fit(
-        X_train, y_train_s,
-        eval_set=[(X_val, y_val_s)],
-        verbose=100,
-    )
+    oof_records: list[pd.DataFrame] = []
+    fold_model_files: list[str] = []
+    fold_best_iters: list[int] = []
 
-    best_iter = int(getattr(model, "best_iteration", args.n_estimators))
-    print(f"\n  Best iteration: {best_iter}")
+    for fold_k in range(args.n_folds):
+        tr_idx  = np.where(fold_ids != fold_k)[0]
+        val_idx = np.where(fold_ids == fold_k)[0]
 
-    # ---- Val metrics ----
-    val_proba = model.predict_proba(X_val)[:, 1].astype(np.float32)
-    roc_auc   = float(roc_auc_score(y_val_s, val_proba))
-    pr_auc    = float(average_precision_score(y_val_s, val_proba))
+        print(f"\n  [fold {fold_k + 1}/{args.n_folds}]  "
+              f"train={len(tr_idx):,}  val={len(val_idx):,}")
 
-    print(f"\n  Val ROC-AUC : {roc_auc:.4f}")
-    print(f"  Val PR-AUC  : {pr_auc:.4f}")
+        Xf_tr  = X_all.iloc[tr_idx]
+        yf_tr  = y_all_s.iloc[tr_idx]
+        Xf_val = X_all.iloc[val_idx]
+        yf_val = y_all_s.iloc[val_idx]
 
-    # ---- Save model ----
+        fold_model = XGBClassifier(**params)
+        fold_model.fit(
+            Xf_tr, yf_tr,
+            eval_set=[(Xf_val, yf_val)],
+            verbose=100,
+        )
+
+        fold_proba = fold_model.predict_proba(Xf_val)[:, 1].astype(np.float32)
+        fold_roc   = float(roc_auc_score(yf_val, fold_proba))
+        fold_pr    = float(average_precision_score(yf_val, fold_proba))
+        print(f"    ROC-AUC={fold_roc:.4f}  PR-AUC={fold_pr:.4f}  "
+              f"best_iter={getattr(fold_model, 'best_iteration', '?')}")
+
+        rec = pd.DataFrame({
+            "fold":    fold_k,
+            "y_true":  yf_val.values,
+            "y_proba": fold_proba,
+        }, index=Xf_val.index)
+        if "road_id" in meta_all.columns:
+            rec.insert(0, "road_id", meta_all["road_id"].iloc[val_idx].values)
+
+        oof_records.append(rec)
+        fold_best_iters.append(int(getattr(fold_model, "best_iteration", args.n_estimators)))
+
+        fold_fname = f"{model_stem}_fold_{fold_k}.ubj"
+        fold_model.save_model(str(models_dir / fold_fname))
+        fold_model_files.append(fold_fname)
+        print(f"    Saved → {fold_fname}")
+
+    oof_df  = pd.concat(oof_records).sort_index().reset_index(drop=True)
+    oof_roc = float(roc_auc_score(oof_df["y_true"], oof_df["y_proba"]))
+    oof_pr  = float(average_precision_score(oof_df["y_true"], oof_df["y_proba"]))
+    print(f"\n  OOF ROC-AUC : {oof_roc:.4f}")
+    print(f"  OOF PR-AUC  : {oof_pr:.4f}")
+
+    oof_path = models_dir / f"{model_stem}_oof_preds.parquet"
+    oof_df.to_parquet(oof_path, index=False)
+    print(f"  Saved OOF predictions → {oof_path}")
+
+    # ==================================================================
+    # FULL MODEL — all data, n_estimators = mean of fold best_iters
+    # (no early stopping needed — spatial CV already calibrated tree count)
+    # ==================================================================
+    mean_best_iter = int(round(sum(fold_best_iters) / len(fold_best_iters)))
+    print(f"\n{'─'*60}")
+    print(f" Full model — all {len(X_all):,} roads  "
+          f"(n_estimators={mean_best_iter} from fold mean)")
+    print(f"{'─'*60}")
+
+    full_params = {**params, "n_estimators": mean_best_iter, "early_stopping_rounds": None}
+    full_model  = XGBClassifier(**full_params)
+    full_model.fit(X_all, y_all_s, verbose=100)
+
     model_path = models_dir / f"{model_stem}.ubj"
-    model.save_model(str(model_path))
-    print(f"\n  Saved model → {model_path}")
+    full_model.save_model(str(model_path))
+    print(f"\n  Saved full model → {model_path}")
 
-    # ---- Save val predictions ----
-    val_preds = pd.DataFrame({
-        "y_true":  y_val_s.values,
-        "y_proba": val_proba,
-    })
-    if meta_val is not None and "road_id" in meta_val.columns:
-        val_preds.insert(0, "road_id", meta_val["road_id"].values)
-    val_preds_path = models_dir / f"{model_stem}_val_preds.parquet"
-    val_preds.to_parquet(val_preds_path, index=False)
-    print(f"  Saved val predictions → {val_preds_path}")
-
-    # ---- Feature importances ----
-    importances = model.get_booster().get_score(importance_type="gain")
-    top_feats = sorted(importances.items(), key=lambda x: x[1], reverse=True)[:30]
+    importances = full_model.get_booster().get_score(importance_type="gain")
+    top_feats   = sorted(importances.items(), key=lambda x: x[1], reverse=True)[:30]
 
     # ---- Save meta ----
-    meta: dict = {
+    meta_out: dict = {
         "model_index":        model_idx,
         "project":            args.project,
         "state":              feature_config.get("state"),
         "model_file":         model_path.name,
-        "best_iteration":     best_iter,
-        "val_roc_auc":        roc_auc,
-        "val_pr_auc":         pr_auc,
-        "n_train":            len(X_train),
-        "n_val":              len(X_val),
-        "n_features":         X_train.shape[1],
-        "positive_rate_train": round(n_pos / (n_pos + n_neg), 4),
-        "positive_rate_val":  round(float(y_val_s.mean()), 4),
+        "n_estimators_full":  mean_best_iter,
+        "fold_best_iters":    fold_best_iters,
+        "oof_roc_auc":        oof_roc,
+        "oof_pr_auc":         oof_pr,
+        "n_folds":            args.n_folds,
+        "fold_type":          "spatial_lat_strips",
+        "fold_model_files":   fold_model_files,
+        "n_all":              len(X_all),
+        "n_features":         X_all.shape[1],
+        "positive_rate_all":  round(n_pos / (n_pos + n_neg), 4),
         "scale_pos_weight":   scale_pos_weight,
-        "xgb_params":         {k: v for k, v in params.items() if k != "scale_pos_weight"},
-        "feature_cols":       feature_config.get("feature_cols", list(X_train.columns)),
-        "top30_feature_importance_gain": [{"feature": f, "gain": round(g, 4)} for f, g in top_feats],
+        "xgb_params":         {k: v for k, v in params.items()
+                               if k not in ("scale_pos_weight", "early_stopping_rounds")},
+        "feature_cols":       feature_config.get("feature_cols", list(X_all.columns)),
+        "top30_feature_importance_gain": [
+            {"feature": f, "gain": round(g, 4)} for f, g in top_feats
+        ],
         "preprocess_config":  {
             k: feature_config.get(k)
-            for k in ("apply_log", "apply_scale", "clip_quantiles", "val_fraction", "random_state")
+            for k in ("apply_log", "apply_scale", "clip_quantiles", "random_state")
         },
     }
     meta_path = models_dir / f"{model_stem}_meta.json"
-    meta_path.write_text(json.dumps(meta, indent=2))
-    print(f"  Saved meta       → {meta_path}")
+    meta_path.write_text(json.dumps(meta_out, indent=2))
+    print(f"  Saved meta → {meta_path}")
 
     # ---- Summary ----
     print(f"\n{'='*60}")
-    print(f" {model_stem}  ROC-AUC={roc_auc:.4f}  PR-AUC={pr_auc:.4f}")
+    print(f" {model_stem}  OOF ROC-AUC={oof_roc:.4f}  OOF PR-AUC={oof_pr:.4f}")
     print(f"{'='*60}")
-    print(f"\n  Top 10 features by gain:")
-    for feat, gain in top_feats[:10]:
+    print(f"\n  Top 30 features by gain:")
+    for feat, gain in top_feats[:30]:
         bar = "█" * int(min(gain / max(importances.values()), 1.0) * 30)
         print(f"    {feat:<45s}  {gain:>10.1f}  {bar}")
 

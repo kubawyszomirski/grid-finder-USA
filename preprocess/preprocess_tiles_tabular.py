@@ -22,7 +22,6 @@ Writes to {project}/{tiles_folder}/preprocessed/:
 
 Usage:
     python preprocess_tiles_tabular.py project-2 500_tiles
-    python preprocess_tiles_tabular.py project-2 500_tiles --val-frac 0.15
     python preprocess_tiles_tabular.py project-2 500_tiles --no-scale
 """
 from __future__ import annotations
@@ -36,7 +35,6 @@ from pathlib import Path
 import geopandas as gpd
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import RobustScaler
 
 warnings.filterwarnings("ignore")
@@ -45,9 +43,8 @@ warnings.filterwarnings("ignore")
 #            CONFIGURATION
 # ==========================================
 
-BASE_DIR     = Path("..")
+BASE_DIR     = Path(__file__).parent.parent
 LABEL_COL    = "grid"
-VAL_FRACTION = 0.20
 RANDOM_STATE = 42
 
 # Columns that are never used as ML features
@@ -120,10 +117,8 @@ def build_report(
     binary_cols: list[str],
     pct_cols: list[str],
     continuous_cols: list[str],
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    X_val: pd.DataFrame,
-    y_val: pd.Series,
+    X_all: pd.DataFrame,
+    y_all: pd.Series,
     X_predict: pd.DataFrame,
 ) -> str:
     sep = "=" * 62
@@ -131,8 +126,7 @@ def build_report(
         sep,
         "  TILE PREPROCESSING REPORT",
         sep,
-        f"  Training rows  : {len(X_train):,}",
-        f"  Validation rows: {len(X_val):,}",
+        f"  Training rows  : {len(X_all):,}",
         f"  Predict rows   : {len(X_predict):,}",
         "",
         f"  Total features : {len(feature_cols)}",
@@ -140,10 +134,8 @@ def build_report(
         f"    percentage   : {len(pct_cols)}",
         f"    continuous   : {len(continuous_cols)}  (log1p transformed)",
         "",
-        f"  Label balance (train):  {y_train.value_counts().to_dict()}",
-        f"  Label balance (val)  :  {y_val.value_counts().to_dict()}",
-        f"  Positive rate  train :  {y_train.mean():.3f}",
-        f"  Positive rate  val   :  {y_val.mean():.3f}",
+        f"  Label balance  : {y_all.value_counts().to_dict()}",
+        f"  Positive rate  : {y_all.mean():.3f}",
         "",
         "-" * 62,
         "  NaN SUMMARY (original training set, before fill):",
@@ -152,7 +144,7 @@ def build_report(
         "-" * 62,
         f"  TOP {min(25, len(feature_cols))} FEATURES BY CORRELATION WITH LABEL (post-transform):",
         "-" * 62,
-        correlation_report(X_train, y_train),
+        correlation_report(X_all, y_all),
     ]
     return "\n".join(lines)
 
@@ -164,7 +156,6 @@ def build_report(
 def preprocess(
     df_train: pd.DataFrame,
     df_predict: pd.DataFrame | None,
-    val_fraction: float = VAL_FRACTION,
     apply_log: bool = True,
     apply_scale: bool = True,
 ) -> dict:
@@ -174,8 +165,9 @@ def preprocess(
       2. Report NaN (before fill)
       3. Fill NaN → 0
       4. Log1p-transform continuous features (optional)
-      5. RobustScaler fit on training, applied to val + predict (optional)
-      6. Stratified train/val split
+      5. RobustScaler fit on all training data, applied to predict (optional)
+
+    No train/val split — K-fold CV in the train script handles validation.
     """
     if LABEL_COL not in df_train.columns:
         raise ValueError(
@@ -189,7 +181,7 @@ def preprocess(
         if c not in META_COLS and c != LABEL_COL and pd.api.types.is_numeric_dtype(df_train[c])
     ]
 
-    meta_train = df_train[[c for c in ("tile_id", "state") if c in df_train.columns]].copy()
+    meta_all   = df_train[[c for c in ("tile_id", "state") if c in df_train.columns]].copy()
     y_all      = df_train[LABEL_COL].fillna(0).astype(int)
     df_nan_ref = df_train[feature_cols].copy()  # keep pre-fill for NaN report
 
@@ -228,21 +220,10 @@ def preprocess(
         X_all_scaled  = X_all_raw
         X_pred_scaled = X_pred_raw
 
-    # ---- 6. Stratified split ----
-    X_train, X_val, y_train, y_val, meta_tr, meta_val = train_test_split(
-        X_all_scaled, y_all, meta_train,
-        test_size=val_fraction,
-        random_state=RANDOM_STATE,
-        stratify=y_all,
-    )
-
     return {
-        "X_train":        X_train,
-        "y_train":        y_train,
-        "meta_train":     meta_tr,
-        "X_val":          X_val,
-        "y_val":          y_val,
-        "meta_val":       meta_val,
+        "X_all":          X_all_scaled,
+        "y_all":          y_all,
+        "meta_all":       meta_all,
         "X_predict":      X_pred_scaled,
         "meta_predict":   meta_predict,
         "scaler":         scaler,
@@ -271,10 +252,6 @@ def main() -> None:
     )
     parser.add_argument("project",   help="Project folder name, e.g. 'project-2'")
     parser.add_argument("tiles_dir", help="Tile folder inside the project, e.g. '500_tiles'")
-    parser.add_argument(
-        "--val-frac", type=float, default=VAL_FRACTION,
-        help=f"Validation fraction (default: {VAL_FRACTION})",
-    )
     parser.add_argument(
         "--no-log",   action="store_true",
         help="Skip log1p transform on continuous features",
@@ -310,19 +287,15 @@ def main() -> None:
     )
     result = preprocess(
         df_train, df_predict,
-        val_fraction=args.val_frac,
         apply_log=not args.no_log,
         apply_scale=not args.no_scale,
     )
 
     # ---- Save parquet ----
     print(f"\nWriting to {out_dir} …")
-    result["X_train"].to_parquet(             out_dir / "X_train.parquet")
-    result["y_train"].to_frame().to_parquet(  out_dir / "y_train.parquet")
-    result["meta_train"].to_parquet(          out_dir / "meta_train.parquet")
-    result["X_val"].to_parquet(               out_dir / "X_val.parquet")
-    result["y_val"].to_frame().to_parquet(    out_dir / "y_val.parquet")
-    result["meta_val"].to_parquet(            out_dir / "meta_val.parquet")
+    result["X_all"].to_parquet(               out_dir / "X_all.parquet")
+    result["y_all"].to_frame().to_parquet(    out_dir / "y_all.parquet")
+    result["meta_all"].to_parquet(            out_dir / "meta_all.parquet")
     result["X_predict"].to_parquet(           out_dir / "X_predict.parquet")
     if not result["meta_predict"].empty:
         result["meta_predict"].to_parquet(    out_dir / "meta_predict.parquet")
@@ -341,13 +314,10 @@ def main() -> None:
         "label_col":       LABEL_COL,
         "apply_log":       not args.no_log,
         "apply_scale":     not args.no_scale,
-        "val_fraction":    args.val_frac,
         "random_state":    RANDOM_STATE,
-        "n_train":         len(result["X_train"]),
-        "n_val":           len(result["X_val"]),
+        "n_all":           len(result["X_all"]),
         "n_predict":       len(result["X_predict"]),
-        "positive_rate_train": float(result["y_train"].mean()),
-        "positive_rate_val":   float(result["y_val"].mean()),
+        "positive_rate_all": float(result["y_all"].mean()),
     }
     with open(out_dir / "feature_config.json", "w") as f:
         json.dump(config, f, indent=2)
@@ -359,16 +329,14 @@ def main() -> None:
         result["binary_cols"],
         result["pct_cols"],
         result["continuous_cols"],
-        result["X_train"], result["y_train"],
-        result["X_val"],   result["y_val"],
+        result["X_all"], result["y_all"],
         result["X_predict"],
     )
     (out_dir / "report.txt").write_text(report)
     print("\n" + report)
 
     print(f"\n[DONE] → {out_dir}")
-    print(f"  X_train:   {result['X_train'].shape}")
-    print(f"  X_val:     {result['X_val'].shape}")
+    print(f"  X_all:     {result['X_all'].shape}")
     print(f"  X_predict: {result['X_predict'].shape}")
 
 
